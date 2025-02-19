@@ -1,4 +1,4 @@
-﻿from handlers.admin_features import AdminFeatures
+from handlers.admin_features import AdminFeatures
 from modules.access_manager import AccessManager
 import json
 import logging
@@ -444,12 +444,16 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le menu d'administration"""
+    is_enabled = access_manager.is_access_code_enabled()
+    status_text = "✅ Activé" if is_enabled else "❌ Désactivé"
+
     keyboard = [
         [InlineKeyboardButton("➕ Ajouter une catégorie", callback_data="add_category")],
         [InlineKeyboardButton("➕ Ajouter un produit", callback_data="add_product")],
         [InlineKeyboardButton("❌ Supprimer une catégorie", callback_data="delete_category")],
         [InlineKeyboardButton("❌ Supprimer un produit", callback_data="delete_product")],
         [InlineKeyboardButton("✏️ Modifier un produit", callback_data="edit_product")],
+        [InlineKeyboardButton(f"🔒 Code d'accès: {status_text}", callback_data="toggle_access_code")],
         [InlineKeyboardButton("📊 Statistiques", callback_data="show_stats")],
         [InlineKeyboardButton("📞 Modifier le contact", callback_data="edit_contact")],
         [InlineKeyboardButton("🛒 Modifier bouton Commander", callback_data="edit_order_button")],
@@ -758,7 +762,7 @@ async def handle_product_media(update: Update, context: ContextTypes.DEFAULT_TYP
     if 'media_count' not in context.user_data:
         context.user_data['media_count'] = 0
 
-    if context.user_data.get('media_invitation_message_id'):
+    if 'media_invitation_message_id' in context.user_data:
         try:
             await context.bot.delete_message(
                 chat_id=update.effective_chat.id,
@@ -767,15 +771,6 @@ async def handle_product_media(update: Update, context: ContextTypes.DEFAULT_TYP
             del context.user_data['media_invitation_message_id']
         except Exception as e:
             print(f"Erreur lors de la suppression du message d'invitation: {e}")
-
-    if context.user_data.get('last_confirmation_message_id'):
-        try:
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=context.user_data['last_confirmation_message_id']
-            )
-        except Exception as e:
-            print(f"Erreur lors de la suppression du message de confirmation: {e}")
 
     context.user_data['media_count'] += 1
 
@@ -797,12 +792,23 @@ async def handle_product_media(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.delete()
 
     message = await update.message.reply_text(
-        f"Photo/Vidéo {context.user_data['media_count']} ajoutée ! Cliquez sur Terminé pour valider :",
+        f"Photo/Vidéo {context.user_data['media_count']} ajoutée !\n"
+        "Vous pouvez continuer à envoyer des médias ou cliquer sur Terminé pour valider :",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Terminé", callback_data="finish_media")],
-            [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")]
+            [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")]
         ])
     )
+    
+    if 'last_confirmation_message_id' in context.user_data:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data['last_confirmation_message_id']
+            )
+        except:
+            pass
+            
     context.user_data['last_confirmation_message_id'] = message.message_id
 
     return WAITING_PRODUCT_MEDIA
@@ -1233,6 +1239,20 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
 
         except Exception as e:
             print(f"Erreur lors de la suppression du produit: {e}")
+            return await show_admin_menu(update, context)
+
+    elif query.data == "toggle_access_code":
+            if str(update.effective_user.id) not in ADMIN_IDS:
+                await query.answer("❌ Vous n'êtes pas autorisé à modifier ce paramètre.")
+                return CHOOSING
+            
+            is_enabled = access_manager.toggle_access_code()
+            status = "activé ✅" if is_enabled else "désactivé ❌"
+        
+            # Afficher un message temporaire
+            await query.answer(f"Le système de code d'accès a été {status}")
+        
+            # Rafraîchir le menu admin
             return await show_admin_menu(update, context)
 
     elif query.data == "edit_order_button":
@@ -1778,6 +1798,7 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                         [InlineKeyboardButton("📝 Nom", callback_data="edit_name")],
                         [InlineKeyboardButton("💰 Prix", callback_data="edit_price")],
                         [InlineKeyboardButton("📝 Description", callback_data="edit_desc")],
+                        [InlineKeyboardButton("📸 Médias", callback_data="edit_media")],  # Nouvelle option
                         [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")]
                     ]
 
@@ -1794,29 +1815,40 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             print(f"Erreur dans editp_: {e}")
             return await show_admin_menu(update, context)
 
-    elif query.data in ["edit_name", "edit_price", "edit_desc"]:
+    elif query.data in ["edit_name", "edit_price", "edit_desc", "edit_media"]:  # Ajout de edit_media
         field_mapping = {
             "edit_name": "name",
             "edit_price": "price",
             "edit_desc": "description",
+            "edit_media": "media"
         }
         field = field_mapping[query.data]
         context.user_data['editing_field'] = field
-        
+    
         category = context.user_data.get('editing_category')
         product_name = context.user_data.get('editing_product')
-        
+    
         product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
-        
+    
         if product:
-            current_value = product.get(field, "Non défini")
             if field == 'media':
+                keyboard = [
+                    [InlineKeyboardButton("❌ Supprimer tous les médias", callback_data="clear_media")],
+                    [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")]
+                ]
+            
+                current_media_count = len(product.get('media', []))
                 await query.message.edit_text(
-                    "📸 Envoyez une nouvelle photo ou vidéo pour ce produit:\n"
-                    "(ou cliquez sur Annuler pour revenir en arrière)",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")
-                    ]])
+                    f"📸 Gestion des médias du produit\n\n"
+                    f"Médias actuels : {current_media_count}\n\n"
+                    "Pour ajouter de nouveaux médias, envoyez des photos ou vidéos.\n"
+                    "Vous pouvez en envoyer plusieurs à la suite.\n"
+                    "Pour terminer, cliquez sur Terminé.\n\n"
+                    "Note : Les nouveaux médias remplaceront les anciens.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Terminé", callback_data="finish_media")],
+                        *keyboard
+                    ])
                 )
                 return WAITING_PRODUCT_MEDIA
             else:
@@ -1834,6 +1866,39 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                     ]])
                 )
                 return WAITING_NEW_VALUE
+
+    elif query.data == "clear_media":
+        category = context.user_data.get('editing_category')
+        product_name = context.user_data.get('editing_product')
+    
+        if category and product_name:
+            for product in CATALOG[category]:
+                if product['name'] == product_name:
+                    if 'media' in product:
+                        del product['media']
+                    save_catalog(CATALOG)
+                
+                    await query.answer("✅ Tous les médias ont été supprimés")
+                    return await show_admin_menu(update, context)
+
+    elif query.data == "finish_media":
+        category = context.user_data.get('editing_category')
+        product_name = context.user_data.get('editing_product')
+    
+        if category and product_name:
+            for product in CATALOG[category]:
+                if product['name'] == product_name:
+                    new_media = context.user_data.get('temp_product_media', [])
+                    if new_media:
+                        product['media'] = new_media
+                        save_catalog(CATALOG)
+                
+            # Nettoyer les données temporaires
+            if 'temp_product_media' in context.user_data:
+                del context.user_data['temp_product_media']
+        
+            await query.answer("✅ Médias mis à jour avec succès")
+            return await show_admin_menu(update, context)
 
     elif query.data == "cancel_edit":
         return await show_admin_menu(update, context)
