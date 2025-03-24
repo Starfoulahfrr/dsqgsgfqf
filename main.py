@@ -1,1974 +1,3969 @@
+from handlers.admin_features import AdminFeatures
+from modules.access_manager import AccessManager
+import json
+import base64
 import logging
-import random
 import asyncio
-import sqlite3
+import shutil
+import os
+import re
+from datetime import datetime, time
 import pytz
-from command_delete_handler import CommandDeleteHandler
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, Defaults
+from telegram.error import NetworkError, TimedOut, RetryAfter
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    CallbackQueryHandler, 
+    MessageHandler, 
+    filters, 
+    ContextTypes, 
+    ConversationHandler
+)
+paris_tz = pytz.timezone('Europe/Paris')
 
-# Variables globales
-active_games = {}
-waiting_games = set()
-game_messages = {}
-CLASSEMENT_MESSAGE_ID = None  # Ajoutez cette ligne
-CLASSEMENT_CHAT_ID = None     # Ajoutez cette ligne
-last_game_message = {}  # {chat_id: message_id}
-last_end_game_message = {}  # {chat_id: message_id}
+STATS_CACHE = None
+LAST_CACHE_UPDATE = None
+admin_features = None
+CATALOG_FILE = 'config/catalog.json'
+# Désactiver les logs de httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Configuration du logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
- 
-GAME_THREAD_ID = 2103
-INITIAL_BALANCE = 1500
-MAX_PLAYERS = 20
-game_messages = {}  # Pour stocker l'ID du message de la partie en cours
+# Charger la configuration
+try:
+    with open('config/config.json', 'r', encoding='utf-8') as f:
+        CONFIG = json.load(f)
+        TOKEN = CONFIG['token']
+        ADMIN_IDS = CONFIG['admin_ids']
+except FileNotFoundError:
+    print("Erreur: Le fichier config.json n'a pas été trouvé!")
+    exit(1)
+except KeyError as e:
+    print(f"Erreur: La clé {e} est manquante dans le fichier config.json!")
+    exit(1)
 
-class Card:
-    def __init__(self, rank, suit):
-        self.rank = rank
-        self.suit = suit
+# Fonctions de gestion du catalogue
+def load_catalog():
+    """Charge le catalogue depuis le fichier JSON"""
+    try:
+        with open(CATALOG_FILE, 'r', encoding='utf-8') as f:
+            catalog = json.load(f)
+            return catalog
+    except FileNotFoundError:
+        print(f"Fichier catalogue non trouvé dans {CATALOG_FILE}, création d'un nouveau catalogue")
+        return {'stats': {'total_views': 0, 'category_views': {}, 'product_views': {}, 
+                'last_updated': datetime.now().strftime('%H:%M:%S'),
+                'last_reset': datetime.now().strftime('%Y-%m-%d')}}
+    except Exception as e:
+        print(f"Erreur lors du chargement du catalogue: {e}")
+        return {}
+
+def save_catalog(catalog):
+    """Sauvegarde le catalogue dans le fichier JSON"""
+    try:
+        # Assurer que le dossier config existe
+        os.makedirs(os.path.dirname(CATALOG_FILE), exist_ok=True)
         
-    def __str__(self):
-        suits = {'♠': '♠️', '♥': '♥️', '♦': '♦️', '♣': '♣️'}
-        return f"{self.rank}{suits[self.suit]}"
-
-class Deck:
-    def __init__(self):
-        ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-        suits = ['♠', '♥', '♦', '♣']
-        self.cards = [Card(rank, suit) for rank in ranks for suit in suits]
-        random.shuffle(self.cards)
-    
-    def deal(self):
-        if not self.cards:
-            # Recréer un deck si vide
-            self.__init__()
-        return self.cards.pop()
-
-class MultiPlayerGame:
-    def __init__(self, host_id, host_name=None):  # Ajout du paramètre host_name avec une valeur par défaut
-        self.host_id = host_id
-        self.host_name = host_name  # Stockage du nom de l'hôte
-        self.players = {}
-        self.dealer_hand = []
-        self.deck = Deck()
-        self.game_status = 'waiting'
-        self.bet_amount = None  # Pour stocker la mise initiale
-        self.created_at = datetime.utcnow()  # Pour tracker le temps de création
-
-    def add_player(self, player_id, bet):
-        if len(self.players) < MAX_PLAYERS and player_id not in self.players:
-            self.players[player_id] = {
-                'hand': [],
-                'bet': bet,
-                'status': 'playing'
-            }
-            return True
-        return False
-
-    def check_timeout(self):
-            """Vérifie si le joueur actuel a dépassé le temps imparti"""
-            if hasattr(self, 'last_action_time'):
-                current_time = datetime.utcnow()
-                time_difference = (current_time - self.last_action_time).total_seconds()
-                return time_difference > 30
-            return False
-
-    def can_split(self, player_id):
-        player_data = self.players[player_id]
-        # Vérifie si le joueur a exactement deux cartes de même rang
-        return len(player_data['hand']) == 2 and player_data['hand'][0].rank == player_data['hand'][1].rank
-
-    def split_hand(self, player_id):
-        player_data = self.players[player_id]
-        if self.can_split(player_id):
-            new_hand = [player_data['hand'].pop()]
-            player_data['hand'] = [player_data['hand'][0], self.deck.deal()]
-            player_data['second_hand'] = [new_hand[0], self.deck.deal()]
-            player_data['status'] = 'playing'
-            return True
-        return False
-
-    def get_host_name(self) -> str:
-        """Retourne le nom de l'hôte de la partie"""
-        return self.host_name if self.host_name else "Inconnu"
+        with open(CATALOG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(catalog, f, indent=4, ensure_ascii=False)
         
-    def get_bet(self) -> int:
-        """Retourne la mise de la partie"""
-        if self.players and self.host_id in self.players:
-            return self.players[self.host_id]['bet']
-        return 0
+    except Exception as e:
+        print(f"Erreur lors de la sauvegarde du catalogue : {e}")
 
-    def is_expired(self) -> bool:
-        """Vérifie si la partie a expiré (plus de 5 minutes)"""
-        if self.game_status != 'waiting':
-            return False
-        time_diff = datetime.utcnow() - self.created_at
-        return time_diff.total_seconds() >= 300  # 5 minutes
+def encode_for_callback(text):
+    """Encode le texte pour le callback_data de manière sécurisée"""
+    try:
+        # Limiter la longueur du callback_data en utilisant un hash court
+        safe_id = str(abs(hash(text)) % 10000)
+        return safe_id
+    except Exception as e:
+        return str(abs(hash(str(text))) % 10000)
 
-    def add_player(self, player_id, bet):
-        if len(self.players) < MAX_PLAYERS and player_id not in self.players:
-            self.players[player_id] = {
-                'hand': [],
-                'bet': bet,
-                'status': 'playing'
-            }
-            if player_id == self.host_id:  # Si c'est l'hôte, on stocke la mise initiale
-                self.bet_amount = bet
-            return True
-        return False
-
-    def calculate_hand(self, hand):
-        """Calcule la valeur d'une main"""
-        if not hand:
-            return 0
-            
-        value = 0
-        aces = 0
-        
-        for card in hand:
-            if card.rank in ['J', 'Q', 'K']:
-                value += 10
-            elif card.rank == 'A':
-                aces += 1
-            else:
-                value += int(card.rank)
-        
-        # Ajouter les as avec la meilleure valeur possible
-        for _ in range(aces):
-            if value + 11 <= 21:
-                value += 11
-            else:
-                value += 1
-                
-        return value
-
-    def get_current_player_id(self):
-        for player_id, player_data in self.players.items():
-            if player_data['status'] == 'playing':
-                return player_id
+def decode_from_callback(safe_id, context):
+    """Décode le texte du callback_data"""
+    try:
+        # Récupérer la valeur originale depuis le context
+        return context.user_data.get(f'callback_{safe_id}')
+    except Exception as e:
         return None
 
-    def next_player(self):
-        """Passe au joueur suivant"""
-        current_player_id = self.get_current_player_id()
-        found_current = False
-        has_next_player = False
-        
-        # Créer une liste ordonnée des joueurs
-        player_ids = list(self.players.keys())
-        if current_player_id in player_ids:
-            current_index = player_ids.index(current_player_id)
-            # Chercher le prochain joueur à partir du joueur actuel
-            for i in range(current_index + 1, len(player_ids)):
-                next_player_id = player_ids[i]
-                if self.players[next_player_id]['status'] == 'playing':
-                    has_next_player = True
-                    break
-        
-        # Si aucun prochain joueur n'est trouvé
-        if not has_next_player:
-            # Vérifier si tous les joueurs ont terminé
-            all_finished = True
-            for player_data in self.players.values():
-                if player_data['status'] == 'playing':
-                    all_finished = False
-                    break
-            
-            if all_finished:
-                self.game_status = 'finished'
-                self.resolve_dealer()
-                self.determine_winners()
-                return True  # Indique que la partie est terminée
-        return False  # La partie continue
-
-    def start_game(self):
-        """Démarre la partie"""
-        if len(self.players) < 1:
-            return False
+def clean_stats():
+    """Nettoie les statistiques des produits et catégories qui n'existent plus"""
+    if 'stats' not in CATALOG:
+        return
     
-        self.game_status = 'playing'
-        self.deal_initial_cards()
-        self.last_action_time = datetime.utcnow()
-        # Compter combien de joueurs sont encore actifs
-        active_players = 0
-        for player_id, player_data in self.players.items():
-            if self.calculate_hand(player_data['hand']) == 21:
-                player_data['status'] = 'blackjack'
-            else:
-                active_players += 1
-                player_data['status'] = 'playing'
+    stats = CATALOG['stats']
     
-        # Ne terminer la partie que si TOUS les joueurs ont un blackjack
-        if active_players == 0:
-            self.game_status = 'finished'
-            self.resolve_dealer()
-            self.determine_winners()
+    # Nettoyer les vues par catégorie
+    if 'category_views' in stats:
+        categories_to_remove = []
+        for category in stats['category_views']:
+            if category not in CATALOG or category == 'stats':
+                categories_to_remove.append(category)
+        
+        for category in categories_to_remove:
+            del stats['category_views'][category]
+            print(f"🧹 Suppression des stats de la catégorie: {category}")
+
+    # Nettoyer les vues par produit
+    if 'product_views' in stats:
+        categories_to_remove = []
+        for category in stats['product_views']:
+            if category not in CATALOG or category == 'stats':
+                categories_to_remove.append(category)
+                continue
+            
+            products_to_remove = []
+            existing_products = [p['name'] for p in CATALOG[category]]
+            
+            for product_name in stats['product_views'][category]:
+                if product_name not in existing_products:
+                    products_to_remove.append(product_name)
+            
+            # Supprimer les produits qui n'existent plus
+            for product in products_to_remove:
+                del stats['product_views'][category][product]
+                print(f"🧹 Suppression des stats du produit: {product} dans {category}")
+            
+            # Si la catégorie est vide après nettoyage, la marquer pour suppression
+            if not stats['product_views'][category]:
+                categories_to_remove.append(category)
+        
+        # Supprimer les catégories vides
+        for category in categories_to_remove:
+            if category in stats['product_views']:
+                del stats['product_views'][category]
+
+    # Mettre à jour la date de dernière modification
+    stats['last_updated'] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    save_catalog(CATALOG)
+
+def get_stats():
+    global STATS_CACHE, LAST_CACHE_UPDATE
+    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     
-        return True
-
-    def deal_initial_cards(self):
-        """Distribution initiale des cartes"""
-        # Distribuer aux joueurs
-        for player_id in self.players:
-            self.players[player_id]['hand'] = [self.deck.deal(), self.deck.deal()]
-            if self.calculate_hand(self.players[player_id]['hand']) == 21:
-                self.players[player_id]['status'] = 'blackjack'
+    # Si le cache existe et a moins de 30 secondes
+    if STATS_CACHE and LAST_CACHE_UPDATE and (current_time - LAST_CACHE_UPDATE).seconds < 30:
+        return STATS_CACHE
         
-        # Distribuer au croupier
-        self.dealer_hand = [self.deck.deal(), self.deck.deal()]
-        self.last_action_time = datetime.utcnow() 
-    def resolve_dealer(self):
-        """Tour du croupier"""
-        while self.calculate_hand(self.dealer_hand) < 17:
-            self.dealer_hand.append(self.deck.deal())
-            
-    def determine_winners(self):
-        """Tour du croupier"""
-        dealer_total = self.calculate_hand(self.dealer_hand)
-        dealer_bust = dealer_total > 21
+    # Sinon, lire le fichier et mettre à jour le cache
+    STATS_CACHE = load_catalog()['stats']
+    LAST_CACHE_UPDATE = current_time
+    return STATS_CACHE
 
-        for player_id, player_data in self.players.items():
-            # Traiter la main principale
-            if player_data['status'] == 'bust':
-                player_data['first_status'] = 'bust'  # Stocker le statut explicitement
-                db.update_game_result(player_id, player_data['bet'], 'lose')
-            elif player_data['status'] == 'blackjack':
-                player_data['first_status'] = 'blackjack'  # Stocker le statut explicitement
-                db.update_game_result(player_id, player_data['bet'], 'blackjack')
-            elif player_data['status'] == 'stand':
-                player_total = self.calculate_hand(player_data['hand'])
-            
-                if dealer_bust:
-                    player_data['first_status'] = 'win'
-                    db.update_game_result(player_id, player_data['bet'], 'win')
-                elif player_total > dealer_total:
-                    player_data['first_status'] = 'win'
-                    db.update_game_result(player_id, player_data['bet'], 'win')
-                elif player_total < dealer_total:
-                    player_data['first_status'] = 'lose'
-                    db.update_game_result(player_id, player_data['bet'], 'lose')
-                else:
-                    player_data['first_status'] = 'push'
-                    db.update_game_result(player_id, player_data['bet'], 'push')
-        
-            # Traiter la seconde main si elle existe
-            if 'second_hand' in player_data:
-                second_total = self.calculate_hand(player_data['second_hand'])
-                if second_total > 21:
-                    player_data['second_status'] = 'bust'
-                    db.update_game_result(player_id, player_data['bet'], 'lose')
-                elif dealer_bust:
-                    player_data['second_status'] = 'win'
-                    db.update_game_result(player_id, player_data['bet'], 'win')
-                elif second_total > dealer_total:
-                    player_data['second_status'] = 'win'
-                    db.update_game_result(player_id, player_data['bet'], 'win')
-                elif second_total < dealer_total:
-                    player_data['second_status'] = 'lose'
-                    db.update_game_result(player_id, player_data['bet'], 'lose')
-                else:
-                    player_data['second_status'] = 'push'
-                    db.update_game_result(player_id, player_data['bet'], 'push')
-
-
-class DatabaseManager:
-    def __init__(self):
-        self.conn = sqlite3.connect('blackjack.db', check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.setup_database()
+def backup_data():
+    """Crée une sauvegarde des fichiers de données"""
+    backup_dir = "backups"
+    if not os.path.exists(backup_dir):
+        os.makedirs(backup_dir)
     
-    def setup_database(self):
-        self.cursor.executescript('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                balance INTEGER DEFAULT 1000,
-                games_played INTEGER DEFAULT 0,
-                games_won INTEGER DEFAULT 0,
-                total_bets INTEGER DEFAULT 0,
-                biggest_win INTEGER DEFAULT 0,
-                last_daily DATETIME
-            );
-            
-            CREATE TABLE IF NOT EXISTS game_history (
-                game_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                bet_amount INTEGER,
-                result TEXT,
-                timestamp DATETIME,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
-            );
-        ''')
-        self.conn.commit()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Backup config.json
+    if os.path.exists("config/config.json"):
+        shutil.copy2("config/config.json", f"{backup_dir}/config_{timestamp}.json")
+    
+    # Backup catalog.json
+    if os.path.exists("config/catalog.json"):
+        shutil.copy2("config/catalog.json", f"{backup_dir}/catalog_{timestamp}.json")
 
-    def register_user(self, user_id: int, username: str) -> bool:
-        """Inscrit un nouvel utilisateur dans la base de données"""
-        try:
-            self.cursor.execute('''
-                INSERT INTO users (
-                    user_id, 
-                    username, 
-                    balance, 
-                    games_played,
-                    games_won,
-                    total_bets,
-                    biggest_win,
-                    last_daily
-                ) VALUES (?, ?, 1000, 0, 0, 0, 0, ?)
-            ''', (user_id, username, '2000-01-01 00:00:00'))
-            self.conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            # Si l'utilisateur existe déjà
-            return False
-        except Exception as e:
-            print(f"Erreur dans register_user: {e}")
-            self.conn.rollback()
-            return False
+def is_category_sold_out(catalog, category):
+    """Vérifie si une catégorie est en SOLD OUT"""
+    if category not in catalog:
+        return False
+    return (len(catalog[category]) == 1 and 
+            isinstance(catalog[category][0], dict) and 
+            catalog[category][0].get('name') == 'SOLD OUT ! ❌')
 
-    def get_username(self, user_id: int) -> str:
-        """Récupère le nom d'utilisateur"""
-        try:
-            self.cursor.execute('SELECT username FROM users WHERE user_id = ?', (user_id,))
-            result = self.cursor.fetchone()
-            return result[0] if result else None
-        except Exception as e:
-            print(f"Erreur dans get_username: {e}")
-            return None
+def print_catalog_debug():
+    """Fonction de debug pour afficher le contenu du catalogue"""
+    for category, products in CATALOG.items():
+        if category != 'stats':
+            print(f"\nCatégorie: {category}")
+            for product in products:
+                print(f"  Produit: {product['name']}")
+                if 'media' in product:
+                    print(f"    Médias ({len(product['media'])}): {product['media']}")
 
-    def update_username(self, user_id: int, new_username: str) -> bool:
-        """Met à jour le nom d'utilisateur"""
-        try:
-            self.cursor.execute('UPDATE users SET username = ? WHERE user_id = ?', 
-                            (new_username, user_id))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            print(f"Erreur dans update_username: {e}")
-            self.conn.rollback()
-            return False
+# États de conversation
+WAITING_FOR_ACCESS_CODE = "WAITING_FOR_ACCESS_CODE"
+CHOOSING = "CHOOSING"
+WAITING_CATEGORY_NAME = "WAITING_CATEGORY_NAME"
+WAITING_PRODUCT_NAME = "WAITING_PRODUCT_NAME"
+WAITING_PRODUCT_PRICE = "WAITING_PRODUCT_PRICE"
+WAITING_PRODUCT_DESCRIPTION = "WAITING_PRODUCT_DESCRIPTION"
+WAITING_PRODUCT_MEDIA = "WAITING_PRODUCT_MEDIA"
+SELECTING_CATEGORY = "SELECTING_CATEGORY"
+SELECTING_CATEGORY_TO_DELETE = "SELECTING_CATEGORY_TO_DELETE"
+SELECTING_PRODUCT_TO_DELETE = "SELECTING_PRODUCT_TO_DELETE"
+WAITING_CONTACT_USERNAME = "WAITING_CONTACT_USERNAME"
+SELECTING_PRODUCT_TO_EDIT = "SELECTING_PRODUCT_TO_EDIT"
+EDITING_PRODUCT_FIELD = "EDITING_PRODUCT_FIELD"
+WAITING_NEW_VALUE = "WAITING_NEW_VALUE"
+WAITING_BANNER_IMAGE = "WAITING_BANNER_IMAGE"
+WAITING_BROADCAST_MESSAGE = "WAITING_BROADCAST_MESSAGE"
+WAITING_ORDER_BUTTON_CONFIG = "WAITING_ORDER_BUTTON_CONFIG"
+WAITING_WELCOME_MESSAGE = "WAITING_WELCOME_MESSAGE"  # Ajout de cette ligne
+EDITING_CATEGORY = "EDITING_CATEGORY"
+WAITING_NEW_CATEGORY_NAME = "WAITING_NEW_CATEGORY_NAME"
+WAITING_BUTTON_NAME = "WAITING_BUTTON_NAME"
+WAITING_BUTTON_VALUE = "WAITING_BUTTON_VALUE"
+WAITING_BROADCAST_EDIT = "WAITING_BROADCAST_EDIT"
+WAITING_GROUP_NAME = "WAITING_GROUP_NAME"
+WAITING_GROUP_USER = "WAITING_GROUP_USER"
 
-    def get_player_rank(self, balance: int) -> tuple[str, str, float, Optional[str]]:
-        """
-        Retourne le rang du joueur basé sur son solde
-        Returns: (emoji, titre, progression, prochain_rang)
-        """
-        ranks = [
-            (0, "🤡 Clochard du Casino"),
-            (500, "🎲 Joueur Amateur"),
-            (1000, "🎰 Joueur Lambda"),
-            (2500, "💰 Petit Parieur"),
-            (5000, "💎 Parieur Régulier"),
-            (10000, "🎩 High Roller"),
-            (25000, "👑 Roi du Casino"),
-            (50000, "🌟 VIP Diamond"),
-            (100000, "🔥 Parieur Fou"),
-            (250000, "🌈 Légende du Casino"),
-            (500000, "⚡ Master des Tables"),
-            (1000000, "🌌 Empereur du Gambling")
-        ]
-        
-        current_rank = ranks[0]
-        for threshold, rank in ranks:
-            if balance >= threshold:
-                current_rank = (threshold, rank)
-            else:
-                break
-                
-        current_index = ranks.index(current_rank)
-        next_rank = ranks[current_index + 1] if current_index < len(ranks) - 1 else None
-        
-        emoji, title = current_rank[1].split(" ", 1)
-        
-        if next_rank:
-            current_threshold = current_rank[0]
-            next_threshold = next_rank[0]
-            progress = ((balance - current_threshold) / (next_threshold - current_threshold)) * 100
-            progress = min(100, max(0, progress))
-        else:
-            progress = 100
+# Charger le catalogue au démarrage
+CATALOG = load_catalog()
 
-        return emoji, title, progress, next_rank[1] if next_rank else None
+# Fonctions de base
 
-    def get_balance(self, user_id: int) -> int:
-        """Récupère le solde d'un utilisateur"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            return result[0] if result else 0
-        except Exception as e:
-            print(f"Erreur dans get_balance: {e}")
-            return 0
-
-    def set_balance(self, user_id: int, amount: int) -> None:
-        """Met à jour le solde d'un utilisateur"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('UPDATE users SET balance = ? WHERE user_id = ?', (amount, user_id))
-            self.conn.commit()
-            cursor.close()
-        except Exception as e:
-            print(f"Erreur dans set_balance: {e}")
-            self.conn.rollback()
-
-    def user_exists(self, user_id: int) -> bool:
-        """Vérifie si un utilisateur existe dans la base de données"""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
-        exists = cursor.fetchone() is not None
-        cursor.close()
-        return exists
-
-    def get_games_played(self, user_id: int) -> int:
-        """Récupère le nombre total de parties jouées"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT games_played FROM users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            return result[0] if result else 0
-        except Exception as e:
-            print(f"Erreur dans get_games_played: {e}")
-            return 0
-
-    def get_wins(self, user_id: int) -> int:
-        """Récupère le nombre total de victoires"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT games_won FROM users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            return result[0] if result else 0
-        except Exception as e:
-            print(f"Erreur dans get_wins: {e}")
-            return 0
-
-    def get_stats(self, user_id: int) -> dict:
-        """Récupère toutes les statistiques d'un joueur"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT balance, games_played, games_won, total_bets, biggest_win
-                FROM users WHERE user_id = ?
-            ''', (user_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if result:
-                return {
-                    'balance': result[0],
-                    'games_played': result[1],
-                    'games_won': result[2],
-                    'total_bets': result[3],
-                    'biggest_win': result[4]
-                }
-            return {
-                'balance': 0,
-                'games_played': 0,
-                'games_won': 0,
-                'total_bets': 0,
-                'biggest_win': 0
-            }
-        except Exception as e:
-            print(f"Erreur dans get_stats: {e}")
-            return {}
-
-    def update_game_result(self, user_id: int, bet_amount: int, result: str):
-        """Met à jour les statistiques après une partie"""
-        multiplier = {
-            'win': 2,
-            'blackjack': 2.5,
-            'lose': 0,
-            'push': 1
-        }.get(result, 0)
-        
-        winnings = int(bet_amount * multiplier)
-        
-        self.cursor.execute('''
-            UPDATE users 
-            SET balance = balance + ?,
-                games_played = games_played + 1,
-                games_won = games_won + CASE WHEN ? IN ('win', 'blackjack') THEN 1 ELSE 0 END,
-                total_bets = total_bets + ?,
-                biggest_win = CASE 
-                    WHEN ? > biggest_win AND ? IN ('win', 'blackjack')
-                    THEN ? ELSE biggest_win 
-                END
-            WHERE user_id = ?
-        ''', (winnings - bet_amount, result, bet_amount, winnings, result, winnings, user_id))
-        
-        self.cursor.execute('''
-            INSERT INTO game_history (user_id, bet_amount, result, timestamp)
-            VALUES (?, ?, ?, ?)
-        ''', (user_id, bet_amount, result, datetime.utcnow()))
-        
-        self.conn.commit()
-
-    def can_claim_daily(self, user_id: int) -> tuple[bool, Optional[timedelta]]:
-        """Vérifie si l'utilisateur peut réclamer sa récompense journalière"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT last_daily FROM users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-            cursor.close()
-            
-            if not result or not result[0]:
-                return True, None
-                
-            last_daily = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
-            now = datetime.utcnow()
-            time_diff = now - last_daily
-            
-            if time_diff.total_seconds() >= 2 * 3600:  # 24 heures
-                return True, None
-            else:
-                time_remaining = timedelta(days=1) - time_diff
-                return False, time_remaining
-                
-        except Exception as e:
-            print(f"Erreur dans can_claim_daily: {e}")
-            return False, None
-
-    def claim_daily(self, user_id: int, amount: int) -> bool:
-        """Donne la récompense journalière à l'utilisateur"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                UPDATE users 
-                SET balance = balance + ?,
-                    last_daily = ?
-                WHERE user_id = ?
-            ''', (amount, datetime.utcnow(), user_id))
-            self.conn.commit()
-            cursor.close()
-            return True
-        except Exception as e:
-            print(f"Erreur dans claim_daily: {e}")
-            self.conn.rollback()
-            return False
-
-    def close(self):
-        """Ferme la connexion à la base de données"""
-        self.conn.close()
-
-
-    def close(self):
-        """Ferme la connexion à la base de données"""
-        self.conn.close()
-
-
-db = DatabaseManager()
-active_games: Dict[int, MultiPlayerGame] = {}  # {host_id: game}
-waiting_games: Set[int] = set()  # host_ids of games waiting for players
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Démarre le bot et inscrit le joueur s'il ne l'est pas déjà"""
-    user = update.effective_user
+async def handle_access_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la vérification du code d'accès"""
+    user_id = update.effective_user.id
+    code = update.message.text.strip()
     chat_id = update.effective_chat.id
-
-    # Vérifier si l'utilisateur existe déjà dans la base de données
-    if not db.user_exists(user.id):
-        # Inscrire l'utilisateur avec les valeurs par défaut
-        if db.register_user(user.id, user.first_name):
-            welcome_message = (
-                f"👋 Bienvenue {user.first_name} !\n\n"
-                f"🎮 Vous jouez au mode BLACKJACK.\n"
-                f"💰 Je vous offre 1000 coins pour commencer !\n\n"
-                f"Commandes disponibles :\n"
-                f"/bj [mise] - Jouer au Blackjack\n"
-                f"/bank - Voir votre solde\n"
-                f"/daily - Réclamer votre bonus quotidien\n"
-                f"/stats - Voir vos statistiques"
-            )
-        else:
-            welcome_message = "❌ Une erreur s'est produite lors de votre inscription. Réessayez plus tard."
-    else:
-        # Obtenir les statistiques du joueur existant
-        stats = db.get_stats(user.id)
-        emoji, title, progress, next_rank = db.get_player_rank(stats['balance'])
-        
-        welcome_message = (
-            f"👋 Re-bonjour {user.first_name} !\n\n"
-            f"💰 Votre solde : {stats['balance']} coins\n"
-            f"{emoji} Rang : {title}\n"
-        )
-        
-        if next_rank:
-            welcome_message += f"📈 Progression : {progress:.1f}% vers {next_rank}\n"
-        
-        welcome_message += (
-            f"\nCommandes disponibles :\n"
-            f"/bj [mise] - Jouer au Blackjack\n"
-            f"/bank - Voir votre solde\n"
-            f"/daily - Réclamer votre bonus quotidien\n"
-            f"/stats - Voir vos statistiques"
-        )
-
-    await update.message.reply_text(welcome_message)
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    stats = db.get_stats(user.id)
     
-    emoji, rank_title, progress, next_rank = db.get_player_rank(stats['balance'])
-    
-    # Barre de progression
-    progress_bar_length = 10
-    filled_length = int(progress_bar_length * progress / 100)
-    progress_bar = "█" * filled_length + "░" * (progress_bar_length - filled_length)
-    
-    win_rate = (stats['games_won'] / stats['games_played'] * 100) if stats['games_played'] > 0 else 0
-    
-    stats_text = (
-        f"*STATISTIQUES DE {user.first_name}*\n"
-        f"━━━━━━━━━━━━━━━\n\n"
-        f"💵 *Solde:* {stats['balance']:,} $\n"
-        f"🎖️ *Rang:* {emoji} {rank_title}\n"
-    )
-    
-    if next_rank:
-        stats_text += (
-            f"\n*Progression vers {next_rank}*\n"
-            f"[{progress_bar}] {progress:.1f}%\n"
-        )
-    else:
-        stats_text += "\n🏆 *Rang Maximum Atteint !*\n"
-    
-    stats_text += (
-        f"\n📊 *Statistiques de Jeu*\n"
-        f"├ Parties jouées: {stats['games_played']}\n"
-        f"├ Victoires: {stats['games_won']}\n"
-        f"├ Taux de victoire: {win_rate:.1f}%\n"
-        f"├ Total parié: {stats['total_bets']:,} $\n"
-        f"└ Plus gros gain: {stats['biggest_win']:,} $\n"
-    )
-    
-    await update.message.reply_text(
-        stats_text,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def set_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande administrative pour définir les crédits d'un joueur
-    Usage: /setcredits [user_id] montant"""
-    
-    user = update.effective_user
-    
-    if not is_admin(user.id):
-        await update.message.reply_text("❌ Cette commande est réservée aux administrateurs.")
-        return
-        
     try:
-        # Vérifier les arguments
-        if len(context.args) != 2:
-            await update.message.reply_text(
-                "❌ Usage incorrect.\n"
-                "Usage: `/setcredits [user_id] montant`\n"
-                "Exemple: `/setcredits 123456789 1000`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-            
-        # Récupérer l'ID utilisateur
-        target_id = int(context.args[0])
-        amount = int(context.args[1])
-        
-        if amount < 0:
-            await update.message.reply_text("❌ Le montant doit être positif.")
-            return
-            
-        # Vérifier si l'utilisateur existe
-        if not db.user_exists(target_id):
-            await update.message.reply_text("❌ Utilisateur non trouvé.")
-            return
-            
-        db.set_balance(target_id, amount)
-        
-        await update.message.reply_text(
-            f"✅ *Crédits modifiés*\n"
-            f"└ ID {target_id}: {amount} 💵",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    except ValueError:
-        await update.message.reply_text("❌ Le montant doit être un nombre valide.")
+        # Supprimer le message de l'utilisateur contenant le code
+        await update.message.delete()
     except Exception as e:
-        print(f"Error in set_credits: {e}")
-        await update.message.reply_text("❌ Une erreur s'est produite.")
+        pass
 
-async def add_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande administrative pour ajouter des crédits à un joueur
-    Usage: /addcredits [user_id] montant"""
+    is_valid, reason = access_manager.verify_code(code, user_id)
     
-    user = update.effective_user
-    
-    if not is_admin(user.id):
-        await update.message.reply_text("❌ Cette commande est réservée aux administrateurs.")
-        return
-        
-    try:
-        # Vérifier les arguments
-        if len(context.args) != 2:
-            await update.message.reply_text(
-                "❌ Usage incorrect.\n"
-                "Usage: `/addcredits [user_id] montant`\n"
-                "Exemple: `/addcredits 123456789 1000`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-            
-        # Récupérer l'ID utilisateur
-        target_id = int(context.args[0])
-        amount = int(context.args[1])
-        
-        # Vérifier si l'utilisateur existe
-        if not db.user_exists(target_id):
-            await update.message.reply_text("❌ Utilisateur non trouvé.")
-            return
-            
-        current_balance = db.get_balance(target_id)
-        new_balance = current_balance + amount
-        
-        if new_balance < 0:
-            await update.message.reply_text("❌ Le solde ne peut pas être négatif.")
-            return
-            
-        db.set_balance(target_id, new_balance)
-        
-        # Emoji en fonction si on ajoute ou retire des crédits
-        operation_emoji = "➕" if amount >= 0 else "➖"
-        amount_abs = abs(amount)
-        
-        await update.message.reply_text(
-            f"✅ *Crédits modifiés*\n"
-            f"├ ID {target_id}\n"
-            f"├ {operation_emoji} {amount_abs} 💵\n"
-            f"└ Nouveau solde: {new_balance} 💵",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    except ValueError:
-        await update.message.reply_text("❌ Le montant doit être un nombre valide.")
-    except Exception as e:
-        print(f"Error in add_credits: {e}")
-        await update.message.reply_text("❌ Une erreur s'est produite.")
-
-async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    current_time = datetime.utcnow()
-    
-    db.cursor.execute('SELECT last_daily FROM users WHERE user_id = ?', (user.id,))
-    result = db.cursor.fetchone()
-    
-    if result and result[0]:
-        last_daily = datetime.fromisoformat(result[0])
-        if current_time - last_daily < timedelta(days=1):
-            next_daily = last_daily + timedelta(days=1)
-            time_remaining = next_daily - current_time
-            hours, remainder = divmod(time_remaining.seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            
-            await update.message.reply_text(
-                f"⏳ *Bonus non disponible*\n\n"
-                f"Revenez dans:\n"
-                f"▫️ {hours}h {minutes}m {seconds}s",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-
-    bonus = 1000
-    db.cursor.execute('''
-        UPDATE users 
-        SET balance = balance + ?, 
-            last_daily = ?
-        WHERE user_id = ?
-    ''', (bonus, current_time, user.id))
-    db.conn.commit()
-    
-    await update.message.reply_text(
-        f"🎁 *BONUS QUOTIDIEN !*\n\n"
-        f"💰 +{bonus} coins ajoutés à votre compte\n"
-        f"💳 Nouveau solde: {db.get_balance(user.id)} coins",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def create_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    message = update.message or update.edited_message
-    chat_id = message.chat_id
-    
-    # Utilisez le THREAD ID spécifique pour les messages de jeu
-    message_thread_id = GAME_THREAD_ID
-    
-    # Vérifier s'il y a déjà une partie en cours dans ce chat
-    for g in active_games.values():
-        if hasattr(g, 'initial_chat_id') and g.initial_chat_id == chat_id and g.game_status == 'playing':
-            error_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text="❌ Une partie est déjà en cours dans ce chat!"
-            )
-            await message.delete()
-            await asyncio.sleep(3)
-            await error_msg.delete()
-            return
-
-    # Supprimer UNIQUEMENT le message "partie terminée" s'il existe
-    if chat_id in last_end_game_message:
+    if is_valid:
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=last_end_game_message[chat_id])
-            del last_end_game_message[chat_id]
-        except Exception:
-            pass
-    try:
-        bet_amount = int(context.args[0])
-    except (IndexError, ValueError):
-        error_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ Veuillez spécifier une mise valide.\n"
-                 "Usage: `/bj [mise]`\n"
-                 "Exemple: `/bj 100`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await message.delete()
-        await asyncio.sleep(3)
-        await error_msg.delete()
-        return
-    
-    if bet_amount < 10 or bet_amount > 1000000:
-        error_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text="❌ La mise doit être entre 10 et 1000000 coins."
-        )
-        await message.delete()
-        await asyncio.sleep(3)
-        await error_msg.delete()
-        return
-    
-    # Vérifier le solde
-    balance = db.get_balance(user.id)
-    if balance < bet_amount:
-        error_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            text=f"❌ Solde insuffisant!\n"
-                 f"Votre solde: {balance} coins"
-        )
-        await message.delete()
-        await asyncio.sleep(3)
-        await error_msg.delete()
-        return
-
-    # Vérifier s'il y a une partie en attente
-    existing_game = None
-    for g in active_games.values():
-        if g.game_status == 'waiting':
-            existing_game = g
-            break
-
-    if existing_game:
-        # Rejoindre la partie existante
-        if user.id in existing_game.players:
-            error_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text="❌ Vous êtes déjà dans cette partie!"
-            )
-            await message.delete()
-            await asyncio.sleep(3)
-            await error_msg.delete()
-            return
-
-        if existing_game.add_player(user.id, bet_amount):
-            await message.delete()
+            # Supprimer tous les messages précédents dans le chat (y compris le message de bienvenue)
+            current_message_id = update.message.message_id
             
-            # Préparer le texte des joueurs
-            players_text = "*👥 JOUEURS:*\n"
-            total_bets = 0
-
-            for player_id, player_data in existing_game.players.items():
-                player = await context.bot.get_chat(player_id)
-                emoji, rank_title, _, _ = db.get_player_rank(db.get_balance(player_id))
-                bet = player_data['bet']
-                total_bets += bet
-                
-                players_text += (
-                    f"└ {emoji} {player.first_name} ➜ {bet} 💵\n"
-                    f"   ├ Rang: {rank_title}\n"
-                    f"   └ Gains possibles:\n"
-                    f"      ├ Blackjack: +{int(bet * 2.5)} 💵\n"
-                    f"      └ Victoire: +{bet * 2} 💵\n"
-                )
-
-            # Créer le keyboard markup pour le créateur
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎮 LANCER LA PARTIE", callback_data="start_game")
-            ]])
-
-            # Supprimer l'ancien message s'il existe
-            if chat_id in last_game_message:
+            # Supprimer les 15 derniers messages pour s'assurer que tout est nettoyé
+            for i in range(current_message_id - 15, current_message_id + 1):
                 try:
-                    await context.bot.delete_message(chat_id, last_game_message[chat_id])
-                except:
-                    pass
-
-            # Envoyer le nouveau message
-            new_message = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                text=f"*🎰 PARTIE EN ATTENTE*\n"
-                     f"━━━━━━━━━━\n\n"
-                     f"{players_text}\n"
-                     f"*ℹ️ INFOS:*\n"
-                     f"├ {len(existing_game.players)}/{MAX_PLAYERS} places\n"
-                     f"├ 💰 Total des mises: {total_bets} 💵\n"
-                     f"└ ⏳ En attente...\n\n"
-                     f"📢 Pour rejoindre:\n"
-                     f"`/bj + mise`",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard
-            )
-            
-            # Sauvegarder l'ID du nouveau message
-            last_game_message[chat_id] = new_message.message_id
-            return
-        else:
-            error_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text="❌ Impossible de rejoindre la partie!"
-            )
-            await message.delete()
-            await asyncio.sleep(3)
-            await error_msg.delete()
-            return
-
-    # Si on arrive ici, c'est qu'il n'y a pas de partie existante
-    # Créer une nouvelle partie
-    cleanup_player_games(user.id)
-    
-    game = MultiPlayerGame(user.id, user.first_name)
-    game.initial_chat_id = chat_id
-    game.add_player(user.id, bet_amount)
-    active_games[user.id] = game
-    waiting_games.add(user.id)
-    
-    # Obtenir le rang du créateur
-    emoji, rank_title, _, _ = db.get_player_rank(balance)
-    
-    # Créer le keyboard markup pour le créateur
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎮 LANCER LA PARTIE", callback_data="start_game")
-    ]])
-    
-    await message.delete()
-    
-    # Supprimer l'ancien message s'il existe
-    if chat_id in last_game_message:
-        try:
-            await context.bot.delete_message(chat_id, last_game_message[chat_id])
-        except:
-            pass
-
-    # Envoyer le nouveau message
-    sent_message = await context.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=message_thread_id,
-        text="*🎰 NOUVELLE PARTIE*\n"
-             "━━━━━━━━━━\n\n"
-             "*👥 JOUEURS:*\n"
-             f"└ {emoji} {user.first_name} ➜ {bet_amount} 💵\n"
-             f"   ├ Rang: {rank_title}\n"
-             f"   └ Gains possibles:\n"
-             f"      ├ Blackjack: +{int(bet_amount * 2.5)} 💵\n"
-             f"      └ Victoire: +{bet_amount * 2} 💵\n\n"
-             f"*ℹ️ INFOS:*\n"
-             f"├ {len(game.players)}/{MAX_PLAYERS} places\n"
-             f"└ ⏳ Expire dans 5 minutes\n\n"
-             "📢 Pour rejoindre:\n"
-             f"`/bj + mise`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keyboard
-    )
-    
-    # Sauvegarder l'ID du nouveau message
-    last_game_message[chat_id] = sent_message.message_id
-    
-    # Programmer la mise à jour et suppression après 5 minutes
-    asyncio.create_task(delete_and_update_game(sent_message, game, context))
-
-async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    
-    if user.id not in active_games:
-        await update.message.reply_text("❌ Vous n'êtes pas l'hôte d'une partie!")
-        return
-    
-    game = active_games[user.id]
-    
-    if game.game_status != 'waiting':
-        await update.message.reply_text("❌ La partie a déjà commencé!")
-        return
-    
-    if len(game.players) < 1:
-        await update.message.reply_text("❌ Il faut au moins 1 joueur pour commencer!")
-        return
-    
-    # Démarrer la partie
-    if game.start_game():
-        if user.id in waiting_games:
-            waiting_games.remove(user.id)
-        await display_game(update, context, game)
-    else:
-        await update.message.reply_text("❌ Impossible de démarrer la partie!")
-
-async def display_game(update: Update, context: ContextTypes.DEFAULT_TYPE, game: MultiPlayerGame):
-    chat_id = game.initial_chat_id if hasattr(game, 'initial_chat_id') and game.initial_chat_id else (
-        update.callback_query.message.chat_id if update.callback_query
-        else update.effective_chat.id
-    )
-    
-    # Définir un THREAD_ID fixe pour tous les messages de jeu
-    message_thread_id = 2103  # Remplacez 2 par votre THREAD_ID souhaité
-    
-    # Vérifier et gérer les blackjacks initiaux si nécessaire
-    if game.game_status == 'playing':
-        all_blackjack = True
-        for player_data in game.players.values():
-            if game.calculate_hand(player_data['hand']) == 21:
-                player_data['status'] = 'blackjack'
-            else:
-                all_blackjack = False
-        if all_blackjack:
-            game.game_status = 'finished'
-            game.resolve_dealer()
-            game.determine_winners()
-
-    current_time = (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M")
-
-    game_text = (
-        "═══『 BLACKJACK 』═══\n\n"
-    )
-    
-    # Croupier
-    dealer_cards = ' '.join(str(card) for card in game.dealer_hand)
-    dealer_total = game.calculate_hand(game.dealer_hand)
-    if game.game_status == 'playing':
-        dealer_cards = f"{str(game.dealer_hand[0])} 🎴"
-        dealer_total = "?"
-    
-    game_text += (
-        f"👨‍💼 *DEALER* │ {dealer_cards}\n"
-        f"├ Total: {dealer_total}\n"
-        "──────────────\n\n"
-    )
-    
-    # Joueurs
-    for player_id, player_data in game.players.items():
-        user = await context.bot.get_chat(player_id)
-        hands = [player_data['hand']]
-        if 'second_hand' in player_data:
-            hands.append(player_data['second_hand'])
-        
-        for index, hand in enumerate(hands):
-            total = game.calculate_hand(hand)
-            # Utiliser le bon statut selon la main
-            if index == 0:
-                status = player_data.get('first_status', player_data['status'])
-            else:
-                status = player_data.get('second_status', 'playing')
-            
-            result_text = ""
-            status_icon = get_status_emoji(status)
-
-            if status == 'blackjack':
-                winnings = int(player_data['bet'] * 2.5)
-                result_text = f"+{winnings}"
-            elif status == 'win':
-                winnings = player_data['bet'] * 2
-                result_text = f"+{winnings}"
-            elif status == 'lose':
-                result_text = f"-{player_data['bet']}"
-            elif status == 'push':
-                result_text = "±0"
-            elif status == 'bust':
-                result_text = f"-{player_data['bet']}"
-
-            game_text += (
-                f"{status_icon} *{user.first_name}* │ {' '.join(str(card) for card in hand)}\n"
-                f"├ Total: {total}\n"
-                f"├ Mise: {player_data['bet']} 💵"
-            )
-            if index == 1:
-                game_text += " (Seconde main)"
-            if result_text and game.game_status == 'finished':
-                game_text += f" │ {result_text}"
-            game_text += "\n──────────────\n\n"
-
-    # Résultats finaux
-    if game.game_status == 'finished':
-        game_text += "*RÉSULTATS*\n"
-        for player_id, player_data in game.players.items():
-            user = await context.bot.get_chat(player_id)
-            first_status = player_data.get('first_status', player_data['status'])
-            second_status = player_data.get('second_status', None)
-            total_result = 0
-
-            # Calculer le résultat de la première main
-            if first_status == 'blackjack':
-                total_result += int(player_data['bet'] * 2.5)
-            elif first_status == 'win':
-                total_result += player_data['bet'] * 2
-            elif first_status in ['lose', 'bust']:
-                total_result -= player_data['bet']
-
-            # Calculer le résultat de la seconde main
-            if second_status:
-                if second_status == 'win':
-                    total_result += player_data['bet'] * 2
-                elif second_status in ['lose', 'bust']:
-                    total_result -= player_data['bet']
-
-            # Afficher le résultat total
-            if total_result > 0:
-                game_text += f"💰 {user.first_name}: *+{total_result}*\n"
-            elif total_result < 0:
-                game_text += f"💸 {user.first_name}: *{total_result}*\n"
-            else:
-                game_text += f"🤝 {user.first_name}: *±0*\n"
-
-        game_text += "\n🎮 */bj [mise]* pour rejouer"
-    elif current_player_id := game.get_current_player_id():
-        player_name = (await context.bot.get_chat(current_player_id)).first_name
-        game_text += f"👉 C'est à *{player_name}* de jouer"
-
-    # Footer
-    game_text += f"\n\n⌚️ {current_time}"
-
-    # Boutons de jeu
-    keyboard = None
-    if game.game_status == 'playing' and (current_player_id := game.get_current_player_id()):
-        buttons = [
-            [
-                InlineKeyboardButton("🎯 CARTE", callback_data="hit"),
-                InlineKeyboardButton("⏹ STOP", callback_data="stand")
-            ]
-        ]
-        
-        # Ajouter le bouton SPLIT uniquement si c'est possible
-        if game.can_split(current_player_id):
-            buttons.append([
-                InlineKeyboardButton("✂️ SPLIT", callback_data="split")
-            ])
-        
-        keyboard = InlineKeyboardMarkup(buttons)
-
-    try:
-        if game.game_status == 'finished':
-            if update.callback_query:
-                try:
-                    await update.callback_query.message.delete()
-                except Exception:
-                    pass
-            elif chat_id in game_messages:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=i)
+                except Exception as e:
+                    pass  # Ignorer silencieusement les erreurs de suppression
+                    
+            # S'assurer que le message de bienvenue initial est supprimé
+            if 'initial_welcome_message_id' in context.user_data:
                 try:
                     await context.bot.delete_message(
                         chat_id=chat_id,
-                        message_id=game_messages[chat_id]
+                        message_id=context.user_data['initial_welcome_message_id']
                     )
-                except Exception:
-                    pass
-
-            message = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,  # Ajout du thread_id ici
-                text=game_text,
-                parse_mode=ParseMode.MARKDOWN
-            )
-
-            host_id = game.host_id
-            if host_id in active_games:
-                del active_games[host_id]
-            if host_id in waiting_games:
-                waiting_games.remove(host_id)
-            if chat_id in game_messages:
-                del game_messages[chat_id]
-
-            end_message = await context.bot.send_message(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,  # Ajout du thread_id ici
-                text="🎰 *La partie est terminée!*\n"
-                     "Vous pouvez maintenant en démarrer une nouvelle avec `/bj [mise]`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            last_end_game_message[chat_id] = end_message.message_id
-        else:
-            if update.callback_query:
-                await update.callback_query.message.edit_text(
-                    text=game_text,
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            elif chat_id in game_messages:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=game_messages[chat_id],
-                    text=game_text,
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                message = await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=message_thread_id,  # Ajout du thread_id ici
-                    text=game_text,
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                game_messages[chat_id] = message.message_id
-
-    except Exception as e:
-        print(f"Error in display_game: {e}")
-
-async def cmds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    commands_text = (
-        "🎮 *COMMANDES DU BLACKJACK* 🎮\n\n"
-        "🎲 *Commandes de jeu:*\n"
-        "└─ `/bj [mise]` - Créer une partie\n"
-        "└─ `/join [mise]` - Rejoindre la partie\n"
-        "📊 *Informations:*\n"
-        "└─ `/stats` - Voir vos statistiques\n"
-        "└─ `/infos` - Règles du jeu\n"
-        "└─ `/cmds` - Liste des commandes\n\n"
-        "💰 *Économie:*\n"
-        "└─ `/daily` - Bonus quotidien\n\n"
-        "💡 *Exemple:*\n"
-        "└─ `/bj 100` - Créer une partie avec 100 coins"
-    )
-    await update.message.reply_text(commands_text, parse_mode=ParseMode.MARKDOWN)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    chat_id = update.effective_chat.id
-
-    if query.data.startswith("admin_"):
-        if not is_admin(user.id):
-            await query.answer("❌ Action réservée aux administrateurs!", show_alert=True)
-            return
-            
-        _, action, host_id = query.data.split("_")
-        host_id = int(host_id)
-        
-        if host_id not in active_games:
-            await query.answer("❌ Cette partie n'existe plus!", show_alert=True)
-            return
-            
-        game = active_games[host_id]
-
-    if query.data == "start_game":
-        # Vérifier si l'utilisateur est le créateur de la partie
-        game = None
-        for g in active_games.values():
-            if g.host_id == user.id and g.game_status == 'waiting':
-                game = g
-                break
-        
-        if not game:
-            await query.answer("❌ Vous n'êtes pas le créateur de cette partie!")
-            return
-            
-        if len(game.players) < 1:
-            await query.answer("❌ Il faut au moins 1 joueur pour commencer!")
-            return
-            
-        # Démarrer la partie
-        if game.start_game():
-            if user.id in waiting_games:
-                waiting_games.remove(user.id)
-            await display_game(update, context, game)
-            await query.answer("✅ La partie commence!")
-        else:
-            await query.answer("❌ Impossible de démarrer la partie!")
-        return
-    
-    # Trouver la partie active
-    game = None
-    for g in active_games.values():
-        if user.id in g.players:
-            game = g
-            break
-    
-    if not game:
-        await query.answer("❌ Aucune partie trouvée!")
-        return
-    
-    current_player_id = game.get_current_player_id()
-    if current_player_id != user.id:
-        await query.answer("❌ Ce n'est pas votre tour!")
-        return
-    
-    player_data = game.players[user.id]
-    game_ended = False
-    
-    try:
-        if query.data == "hit":
-            if 'current_hand' not in player_data:
-                player_data['current_hand'] = 'hand'
-            current_hand = player_data['current_hand']
-            new_card = game.deck.deal()
-            player_data[current_hand].append(new_card)
-            total = game.calculate_hand(player_data[current_hand])
-
-            if total > 21:
-                if current_hand == 'hand' and 'second_hand' in player_data:
-                    # Si c'est la première main qui bust et qu'il y a une seconde main
-                    player_data['first_status'] = 'bust'  # Marquer la première main comme bust
-                    player_data['current_hand'] = 'second_hand'  # Passer à la seconde main
-                    player_data['status'] = 'playing'  # Maintenir le statut de jeu
-                    await query.answer("💥 Première main bust! Passons à la seconde main.")
-                else:
-                    # Si c'est la seconde main ou s'il n'y a pas de seconde main
-                    if current_hand == 'second_hand':
-                        player_data['second_status'] = 'bust'
-                    player_data['status'] = 'bust'
-                    game_ended = game.next_player()
-                    await query.answer("💥 Vous avez dépassé 21!")
-            elif total == 21:
-                if current_hand == 'hand' and 'second_hand' in player_data:
-                    # Si c'est la première main qui fait 21 et qu'il y a une seconde main
-                    player_data['first_status'] = 'blackjack'
-                    player_data['current_hand'] = 'second_hand'
-                    player_data['status'] = 'playing'
-                    await query.answer("🌟 Blackjack sur la première main! Passons à la seconde.")
-                else:
-                    # Si c'est la seconde main ou s'il n'y a pas de seconde main
-                    if current_hand == 'second_hand':
-                        player_data['second_status'] = 'blackjack'
-                    player_data['status'] = 'blackjack'
-                    game_ended = game.next_player()
-                    await query.answer("🌟 Blackjack!")
-            else:
-                await query.answer(f"🎯 Total: {total}")
-        
-        elif query.data == "stand":
-            if 'current_hand' not in player_data:
-                player_data['current_hand'] = 'hand'
-            current_hand = player_data['current_hand']
-    
-            if current_hand == 'hand' and 'second_hand' in player_data:
-                player_data['current_hand'] = 'second_hand'
-                player_data['first_status'] = 'stand'  # Stocker le statut de la première main séparément
-                player_data['status'] = 'playing'  # Garder le statut principal comme 'playing'
-                await query.answer("⏹ Vous restez sur la première main, à la seconde")
-            else:
-                if current_hand == 'second_hand':
-                    player_data['second_status'] = 'stand'
-                    player_data['status'] = 'stand'  # Maintenant on peut mettre stand car c'est fini
-                else:
-                    player_data['status'] = 'stand'
-                game_ended = game.next_player()
-                await query.answer("⏹ Vous restez")
-        
-        elif query.data == "split":
-            if game.split_hand(user.id):
-                player_data['current_hand'] = 'hand'
-                await query.answer("✂️ Vous avez splitté votre main!")
-            else:
-                await query.answer("❌ Impossible de splitter la main!")
-        
-        # Mise à jour de l'affichage
-        await display_game(update, context, game)
-        
-        # Si la partie est terminée
-        if game_ended:
-            # Mémoriser tous les joueurs de cette partie
-            players_in_game = list(game.players.keys())
-            host_id = game.host_id
-            
-            # Nettoyer toutes les références à la partie
-            if host_id in active_games:
-                del active_games[host_id]
-            if host_id in waiting_games:
-                waiting_games.remove(host_id)
-            if chat_id in game_messages:
-                del game_messages[chat_id]
-            
-            # Nettoyer chaque joueur des parties actives
-            for player_id in players_in_game:
-                for game_id in list(active_games.keys()):  # Utiliser une copie de la liste des clés
-                    if player_id in active_games[game_id].players:
-                        del active_games[game_id]
-    
-    except Exception as e:
-        print(f"Error in button_handler: {e}")
-        await query.answer("❌ Une erreur s'est produite!")
-
-async def error_handler(update: Update, context):
-    print(f"An error occurred: {context.error}")  # Debug log
-    logger.error(f"Update {update} caused error {context.error}")
-
-async def delete_and_update_game(message, game, context, delay_seconds: int = 300):
-    """Gère l'expiration d'une partie après un délai"""
-    try:
-        await asyncio.sleep(delay_seconds)
-        
-        # Vérifier si la partie est toujours en attente
-        host_id = game.host_id
-        if host_id in waiting_games:
-            # Supprimer la partie des jeux actifs
-            if host_id in active_games:
-                del active_games[host_id]
-            waiting_games.remove(host_id)
-            
-            # Préparer le message d'expiration
-            expired_message = (
-                "*🎰 PARTIE EXPIRÉE*\n"
-                "━━━━━━━━━━\n\n"
-                f"❌ Cette partie a expiré après 5 minutes\n"
-                f"👤 Créée par: *{game.get_host_name()}*\n"
-                f"💰 Mise: *{game.get_bet()}* coins\n"
-                f"⏰ Status: Annulée (temps écoulé)"
-            )
-            
-            # Essayer d'envoyer un nouveau message si la mise à jour échoue
-            try:
-                await message.edit_text(
-                    expired_message,
-                    message_thread_id=message_thread_id,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as edit_error:
-                # Si la mise à jour échoue, essayer d'envoyer un nouveau message
-                try:
-                    chat_id = message.chat_id
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=expired_message,
-                        message_thread_id=message_thread_id,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                except Exception as send_error:
-                    print(f"Impossible d'envoyer le message d'expiration: {send_error}")
-                    
-    except Exception as e:
-        print(f"Erreur dans delete_and_update_game: {e}")
-
-async def infos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🎰 *BLACKJACK - RÈGLES DU JEU* 🎰\n\n"
-        "*🎯 Objectif:*\n"
-        "└─ Obtenir un total plus proche de 21 que le croupier\n"
-        "└─ Ne pas dépasser 21\n\n"
-        "*🃏 Valeurs des cartes:*\n"
-        "└─ As ➜ 1 ou 11\n"
-        "└─ Roi, Dame, Valet ➜ 10\n"
-        "└─ Autres cartes ➜ Valeur faciale\n\n"
-        "*💰 Gains:*\n"
-        "└─ Blackjack (21) ➜ x2.5\n"
-        "└─ Victoire ➜ x2\n"
-        "└─ Égalité ➜ Mise remboursée\n\n"
-        "*📌 Limites:*\n"
-        "└─ Mise min: 10 coins\n"
-        "└─ Mise max: 1000000 coins\n"
-        f"└─ {MAX_PLAYERS} joueurs maximum\n\n"
-        "*⚡️ Actions en jeu:*\n"
-        "└─ 🎯 CARTE - Tirer une carte\n"
-        "└─ ⏹ RESTER - Garder sa main"
-    )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche les statistiques du joueur"""
-    user = update.effective_user
-    balance = db.get_balance(user.id)
-    
-    emoji, rank_title, progress, next_rank = get_player_rank(balance)
-    
-    # Crée une barre de progression
-    progress_bar_length = 10
-    filled_length = int(progress_bar_length * progress / 100)
-    progress_bar = "█" * filled_length + "░" * (progress_bar_length - filled_length)
-    
-    stats_text = (
-        f"*STATISTIQUES DE {user.first_name}*\n"
-        f"━━━━━━━━━━━━━━━\n\n"
-        f"💵 *Solde:* {balance:,} $\n"
-        f"🎖️ *Rang:* {emoji} {rank_title}\n"
-    )
-    
-    if next_rank:
-        stats_text += (
-            f"\n*Progression vers {next_rank}*\n"
-            f"[{progress_bar}] {progress:.1f}%\n"
-        )
-    else:
-        stats_text += "\n🏆 *Rang Maximum Atteint !*\n"
-    
-    # Ajoute des statistiques de jeu si tu en as
-    games_played = db.get_games_played(user.id)  # Tu devras créer cette fonction
-    wins = db.get_wins(user.id)  # Tu devras créer cette fonction
-    
-    if games_played:
-        win_rate = (wins / games_played) * 100
-        stats_text += (
-            f"\n📊 *Statistiques de Jeu*\n"
-            f"├ Parties jouées: {games_played}\n"
-            f"├ Victoires: {wins}\n"
-            f"└ Taux de victoire: {win_rate:.1f}%\n"
-        )
-    
-    await update.message.reply_text(
-        stats_text,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menu d'administration pour les admins"""
-    user = update.effective_user
-    
-    if not is_admin(user.id):
-        await update.message.reply_text("❌ Cette commande est réservée aux administrateurs.")
-        return
-        
-    # Trouver toutes les parties en attente
-    waiting_games_list = []
-    for host_id, game in active_games.items():
-        if game.game_status == 'waiting':
-            host_name = game.get_host_name()
-            players_count = len(game.players)
-            total_bet = sum(p['bet'] for p in game.players.values())
-            waiting_games_list.append((host_id, host_name, players_count, total_bet))
-    
-    if not waiting_games_list:
-        await update.message.reply_text(
-            "🎮 *MENU ADMIN*\n\n"
-            "Aucune partie en attente.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-        
-    # Créer les boutons pour chaque partie
-    keyboard = []
-    for host_id, host_name, players_count, total_bet in waiting_games_list:
-        # Bouton pour forcer le démarrage
-        start_button = InlineKeyboardButton(
-            f"▶️ Start",
-            callback_data=f"admin_start_{host_id}"
-        )
-        # Bouton pour annuler
-        cancel_button = InlineKeyboardButton(
-            f"❌ Cancel",
-            callback_data=f"admin_cancel_{host_id}"
-        )
-        keyboard.append([start_button, cancel_button])
-    
-    message = "🎮 *MENU ADMIN*\n\n*Parties en attente:*\n\n"
-    
-    for host_id, host_name, players_count, total_bet in waiting_games_list:
-        message += (
-            f"👤 Hôte: *{host_name}*\n"
-            f"├ ID: `{host_id}`\n"
-            f"├ Joueurs: {players_count}\n"
-            f"└ Total mises: {total_bet} 💵\n\n"
-        )
-    
-    await update.message.reply_text(
-        message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def rangs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche tous les rangs disponibles"""
-    ranks = [
-        (0, "🤡 Clochard du Casino"),
-        (500, "🎲 Joueur Amateur"),
-        (1000, "🎰 Joueur Lambda"),
-        (2500, "💰 Petit Parieur"),
-        (5000, "💎 Parieur Régulier"),
-        (10000, "🎩 High Roller"),
-        (25000, "👑 Roi du Casino"),
-        (50000, "🌟 VIP Diamond"),
-        (100000, "🔥 Parieur Fou"),
-        (250000, "🌈 Légende du Casino"),
-        (500000, "⚡ Master des Tables"),
-        (1000000, "🌌 Empereur du Gambling")
-    ]
-    
-    text = "*📊 RANGS DU CASINO 📊*\n━━━━━━━━━━━━━━━\n\n"
-    
-    # Afficher tous les rangs
-    for threshold, rank in ranks:
-        text += f"*{rank}*\n└ Requis: {threshold:,} $\n\n"
-    
-    # Ajouter le rang actuel du joueur
-    user_balance = db.get_balance(update.effective_user.id)
-    emoji, rank_title, progress, next_rank = db.get_player_rank(user_balance)
-    
-    text += (
-        f"\n*Votre rang actuel:*\n"
-        f"└ {emoji} {rank_title}\n"
-    )
-    
-    if next_rank:
-        # Créer une barre de progression
-        progress_bar_length = 10
-        filled_length = int(progress_bar_length * progress / 100)
-        progress_bar = "█" * filled_length + "░" * (progress_bar_length - filled_length)
-        
-        text += (
-            f"\n*Progression vers {next_rank}*\n"
-            f"[{progress_bar}] {progress:.1f}%\n"
-        )
-    else:
-        text += "\n🏆 *Rang Maximum Atteint !*"
-    
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le solde et les informations bancaires du joueur"""
-    user = update.effective_user
-    
-    # Vérifier si l'utilisateur existe
-    if not db.user_exists(user.id):
-        await update.message.reply_text("❌ Vous devez d'abord utiliser /start pour vous inscrire !")
-        return
-    
-    # Récupérer les stats du joueur
-    stats = db.get_stats(user.id)
-    emoji, title, progress, next_rank = db.get_player_rank(stats['balance'])
-    
-    # Créer le message avec les informations bancaires
-    bank_message = (
-        f"🏦 Informations bancaires de {user.first_name}\n\n"
-        f"💰 Solde : {stats['balance']} coins\n"
-        f"{emoji} Rang : {title}\n"
-    )
-    
-    # Ajouter la progression vers le prochain rang si disponible
-    if next_rank:
-        bank_message += f"📈 Progression : {progress:.1f}% vers {next_rank}"
-
-    await update.message.reply_text(bank_message)
-
-
-def is_admin(user_id: int):
-    """Vérifie si l'utilisateur est administrateur"""
-    return user_id in ADMIN_USERS
-
-def cleanup_player_games(player_id):
-    """Nettoie toutes les références à un joueur dans les parties actives"""
-    for game_id in list(active_games.keys()):
-        if player_id in active_games[game_id].players:
-            del active_games[game_id]
-    if player_id in waiting_games:
-        waiting_games.remove(player_id)
-
-def get_player_rank(balance: int) -> tuple[str, str]:
-    """
-    Retourne le rang du joueur basé sur son solde
-    Returns: (emoji, titre)
-    """
-    ranks = [
-        (0, "🤡 Clochard du Casino"),
-        (500, "🎲 Joueur Amateur"),
-        (1000, "🎰 Joueur Lambda"),
-        (2500, "💰 Petit Parieur"),
-        (5000, "💎 Parieur Régulier"),
-        (10000, "🎩 High Roller"),
-        (25000, "👑 Roi du Casino"),
-        (50000, "🌟 VIP Diamond"),
-        (100000, "🔥 Parieur Fou"),
-        (250000, "🌈 Légende du Casino"),
-        (500000, "⚡ Master des Tables"),
-        (1000000, "🌌 Empereur du Gambling")
-    ]
-    
-    current_rank = ranks[0]  # Rang par défaut
-    for threshold, rank in ranks:
-        if balance >= threshold:
-            current_rank = (threshold, rank)
-        else:
-            break
-            
-    # Trouve le prochain rang
-    current_index = ranks.index(current_rank)
-    next_rank = ranks[current_index + 1] if current_index < len(ranks) - 1 else None
-    
-    # Sépare l'emoji du titre
-    emoji, title = current_rank[1].split(" ", 1)
-    
-    # Calcule la progression vers le prochain rang
-    if next_rank:
-        current_threshold = current_rank[0]
-        next_threshold = next_rank[0]
-        progress = ((balance - current_threshold) / (next_threshold - current_threshold)) * 100
-        progress = min(100, max(0, progress))  # Garde entre 0 et 100
-    else:
-        progress = 100
-
-    return emoji, title, progress, next_rank[1] if next_rank else None
-    
-def get_status_emoji(status: str) -> str:
-    emojis = {
-        'waiting': '⏳',
-        'playing': '🎮',
-        'bust': '💥',
-        'stand': '⏹',
-        'blackjack': '🌟',
-        'win': '🎉',
-        'lose': '💀',
-        'push': '🤝'
-    }
-    return f"{emojis.get(status, '❓')} {status.upper()}"
-
-async def check_game_timeouts(context: ContextTypes.DEFAULT_TYPE):
-    games_to_check = list(active_games.items())  # Créer une copie
-    for game_id, game in games_to_check:
-        if game.game_status == 'playing':
-            current_player_id = game.get_current_player_id()
-            if current_player_id and game.check_timeout():
-                try:
-                    player_data = game.players[current_player_id]
-                    if player_data['status'] == 'playing':
-                        player_data['status'] = 'stand'
-                        game_ended = game.next_player()
-                        game.last_action_time = datetime.utcnow()
-
-                        if game_ended:
-                            game.game_status = 'finished'
-                            game.resolve_dealer()
-                            game.determine_winners()
-                        
-                        # Créer un faux update pour display_game
-                        dummy_update = Update(0, None)
-                        await display_game(dummy_update, context, game)
-
                 except Exception as e:
-                    print(f"Erreur dans check_game_timeouts: {e}")
-
-async def update_classement_job(context: ContextTypes.DEFAULT_TYPE):
-    """Met à jour automatiquement le classement"""
-    if CLASSEMENT_MESSAGE_ID is not None and CLASSEMENT_CHAT_ID is not None:
-        cursor = db.conn.cursor()
-        cursor.execute("""
-            SELECT username, balance 
-            FROM users 
-            ORDER BY balance DESC 
-            LIMIT 50
-        """)
-        
-        rankings = cursor.fetchall()
-        current_time = (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M")
-
-        
-        message = (
-            "🎯 *CLASSEMENT* 🎯\n"
-            "━━━━━━━━━━━━━━━\n\n"
-        )
-        
-        for i, (username, balance) in enumerate(rankings, 1):
-            emoji, rank_title, _, _ = db.get_player_rank(balance)
-            
-            if i == 1:
-                medal = "👑"
-            elif i == 2:
-                medal = "🥈"
-            elif i == 3:
-                medal = "🥉"
-            elif i <= 10:
-                medal = "⭐"
-            else:
-                medal = "•"
+                    pass
                 
-            message += (
-                f"{medal} *#{i}* {emoji} *{username}*\n"
-                f"├ {rank_title}\n"
-                f"└ {balance:,} 💵\n"
-            )
+            # Nettoyer les données stockées
+            context.user_data.clear()  # Nettoyer toutes les données stockées
             
-            if i in [3, 10]:
-                message += "━━━━━━━━━━━━━━━\n"
-            else:
-                message += "\n"
-                
-        message += f"\n⌚️ Mis à jour: {current_time}"
-        
-        try:
-            await context.bot.edit_message_text(
-                chat_id=CLASSEMENT_CHAT_ID,
-                message_id=CLASSEMENT_MESSAGE_ID,
-                text=message,
-                parse_mode=ParseMode.MARKDOWN
-            )
         except Exception as e:
-            logger.error(f"Erreur mise à jour classement: {e}")
-
-async def classement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Affiche un classement des 50 meilleurs joueurs
-    Se met à jour automatiquement toutes les 5 minutes
-    """
-    global CLASSEMENT_MESSAGE_ID, CLASSEMENT_CHAT_ID
-    
-    # Vérifier si le classement existe déjà
-    if CLASSEMENT_MESSAGE_ID is not None:
+            pass  # Ignorer silencieusement les erreurs
+        
+        # Redirection vers le menu principal sans messages supplémentaires
+        return await start(update, context)
+    else:
+        # Gérer le code invalide avec une popup au lieu d'un message
+        error_messages = {
+            "expired": "❌ Ce code a expiré",
+            "invalid": "❌ Code invalide",
+        }
+        
         try:
             await update.message.reply_text(
-                "❌ Le classement est déjà actif dans un autre chat.\n"
-                "Il ne peut être affiché qu'à un seul endroit à la fois."
+                text=error_messages.get(reason, "Code invalide"),
+                reply_markup=None
             )
-        except Exception:
+        except Exception as e:
             pass
-        return
-    
-    cursor = db.conn.cursor()
-    cursor.execute("""
-        SELECT username, balance 
-        FROM users 
-        ORDER BY balance DESC 
-        LIMIT 50
-    """)
-    
-    rankings = cursor.fetchall()
-    
-    # Corriger l'heure pour qu'elle soit à l'heure française
-    current_time = (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M")
-
-    
-    message = (
-        "🎯 *CLASSEMENT* 🎯\n"
-        "━━━━━━━━━━━━━━━\n\n"
-    )
-    
-    for i, (username, balance) in enumerate(rankings, 1):
-        # Obtenir le rang du joueur avec son emoji et son titre
-        emoji, rank_title, _, _ = db.get_player_rank(balance)
-        
-        # Médailles pour le podium
-        if i == 1:
-            medal = "👑"
-        elif i == 2:
-            medal = "🥈"
-        elif i == 3:
-            medal = "🥉"
-        elif i <= 10:
-            medal = "⭐"
-        else:
-            medal = "•"
             
-        # Formater chaque entrée avec le nom du rang
-        message += (
-            f"{medal} *#{i}* {emoji} *{username}*\n"
-            f"├ {rank_title}\n"
-            f"└ {balance:,} 💵\n"
-        )
-        
-        # Ajouter un séparateur après le podium et top 10
-        if i in [3, 10]:
-            message += "━━━━━━━━━━━━━━━\n"
-        else:
-            message += "\n"
-            
-    # Ajouter le timestamp de mise à jour
-    message += f"\n⌚️ Mis à jour: {current_time}"
-    
-    try:
-        # Si c'est une nouvelle commande (pas une mise à jour automatique)
-        if update and update.message:
-            # Vérifier si c'est un supergroupe
-            if update.effective_chat.type == "supergroup":
-                # Envoyer le nouveau message de classement
-                sent_message = await update.message.reply_text(
-                    message,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                CLASSEMENT_MESSAGE_ID = sent_message.message_id
-                CLASSEMENT_CHAT_ID = update.effective_chat.id
-            else:
-                await update.message.reply_text(
-                    "❌ Cette commande doit être utilisée dans un supergroupe pour fonctionner correctement."
-                )
-        # Si c'est une mise à jour automatique
-        elif CLASSEMENT_MESSAGE_ID and CLASSEMENT_CHAT_ID:
-            await context.bot.edit_message_text(
-                chat_id=CLASSEMENT_CHAT_ID,
-                message_id=CLASSEMENT_MESSAGE_ID,
-                text=message,
-                parse_mode=ParseMode.MARKDOWN
-            )
-    except Exception as e:
-        logger.error(f"Erreur mise à jour classement: {e}")
+        return WAITING_FOR_ACCESS_CODE
 
-async def reset_classement(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande admin pour réinitialiser le classement"""
-    global CLASSEMENT_MESSAGE_ID, CLASSEMENT_CHAT_ID
-    
-    if not is_admin(update.effective_user.id):
+async def admin_generate_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Génère un nouveau code d'accès (commande admin)"""
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.message.reply_text("❌ Cette commande est réservée aux administrateurs.")
         return
-        
-    CLASSEMENT_MESSAGE_ID = None
-    CLASSEMENT_CHAT_ID = None
-    await update.message.reply_text("✅ Le classement a été réinitialisé.")
 
-def main():
+    code, expiration = access_manager.generate_code(update.effective_user.id)
+    
+    # Formater l'expiration
+    exp_date = datetime.fromisoformat(expiration)
+    exp_str = exp_date.strftime("%d/%m/%Y %H:%M")
+    
+    await update.message.reply_text(
+        f"✅ Nouveau code généré :\n\n"
+        f"Code: `{code}`\n"
+        f"Expire le: {exp_str}",
+        parse_mode='Markdown'
+    )
+
+async def admin_list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Liste tous les codes actifs (commande admin)"""
+    if str(update.effective_user.id) not in ADMIN_IDS:
+        await update.message.reply_text("❌ Cette commande est réservée aux administrateurs.")
+        return
+
+    active_codes = access_manager.list_active_codes()
+    
+    if not active_codes:
+        await update.message.reply_text("Aucun code actif.")
+        return
+
+    message = "📝 Codes actifs :\n\n"
+    for code in active_codes:
+        exp_date = datetime.fromisoformat(code["expiration"])
+        exp_str = exp_date.strftime("%d/%m/%Y %H:%M")
+        message += f"Code: `{code['code']}`\n"
+        message += f"Expire le: {exp_str}\n\n"
+
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    
+    # Supprimer silencieusement la commande /start si possible
+    if hasattr(update, 'message') and update.message:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+    
+    # Enregistrer utilisateur
+    await admin_features.register_user(user)
+
+    if admin_features.is_user_banned(user.id):
+        # Supprimer tous les messages précédents du bot
+        try:
+            # Supprimer les messages stockés dans le context
+            messages_to_delete = [
+                'menu_message_id',
+                'banner_message_id',
+                'category_message_id',
+                'last_product_message_id',
+                'initial_welcome_message_id'
+            ]
+            
+            for message_key in messages_to_delete:
+                if message_key in context.user_data:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=chat_id,
+                            message_id=context.user_data[message_key]
+                        )
+                        del context.user_data[message_key]
+                    except Exception:
+                        pass
+            
+            # Vider les données utilisateur
+            context.user_data.clear()
+        except Exception as e:
+            print(f"Erreur lors de la suppression des messages: {e}")
+        
+        return ConversationHandler.END
+    # Vérifier si l'utilisateur est autorisé
+    if not access_manager.is_authorized(user.id):
+        # Supprimer l'ancien message de bienvenue s'il existe
+        if 'initial_welcome_message_id' in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=context.user_data['initial_welcome_message_id']
+                )
+            except Exception:
+                pass
+        
+        # Envoyer le nouveau message de bienvenue
+        welcome_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="🔒 Bienvenue ! Pour accéder au bot, veuillez entrer votre code d'accès."
+        )
+        # Sauvegarder l'ID du message de bienvenue
+        context.user_data['initial_welcome_message_id'] = welcome_msg.message_id
+        return WAITING_FOR_ACCESS_CODE
+    
+    # Supprimer les anciens messages si nécessaire
+    if 'menu_message_id' in context.user_data:
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=context.user_data['menu_message_id']
+            )
+        except:
+            pass
+    
+    # Supprimer l'ancienne bannière si elle existe
+    if 'banner_message_id' in context.user_data:
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=context.user_data['banner_message_id']
+            )
+            del context.user_data['banner_message_id']
+        except:
+            pass
+    
+    # Menu standard pour tous les utilisateurs
+    keyboard = [
+        [InlineKeyboardButton("📋 MENU", callback_data="show_categories")]
+    ]
+
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    # Ajouter les boutons personnalisés
+    for button in config.get('custom_buttons', []):
+        if button['type'] == 'url':
+            keyboard.append([InlineKeyboardButton(button['name'], url=button['value'])])
+        elif button['type'] == 'text':
+            keyboard.append([InlineKeyboardButton(button['name'], callback_data=f"custom_text_{button['id']}")])
+
+    # Définir le texte de bienvenue ici, avant les boutons
+    welcome_text = CONFIG.get('welcome_message', 
+        "🌿 <b>Bienvenue sur votre bot !</b> 🌿\n\n"
+        "<b>Pour changer ce message d accueil, rendez vous dans l onglet admin.</b>\n"
+        "📋 Cliquez sur MENU pour voir les catégories"
+    )
+
+    # Ajouter les boutons de contact et réseaux en colonne
+
+
+    # Ajouter le bouton admin si l'utilisateur est administrateur
+    if str(update.effective_user.id) in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("🔧 Menu Admin", callback_data="admin")])
+
     try:
-        defaults = Defaults(parse_mode=ParseMode.MARKDOWN)
+        # Vérifier si une image banner est configurée
+        if CONFIG.get('banner_image'):
+            banner_message = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=CONFIG['banner_image']
+            )
+            context.user_data['banner_message_id'] = banner_message.message_id
+
+        # Envoyer le menu d'accueil
+        menu_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'  
+        )
+        context.user_data['menu_message_id'] = menu_message.message_id
+        
+    except Exception as e:
+        print(f"Erreur lors du démarrage: {e}")
+        # En cas d'erreur, envoyer au moins le menu
+        menu_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        context.user_data['menu_message_id'] = menu_message.message_id
+    
+    return CHOOSING
+
+async def show_networks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche tous les réseaux sociaux"""
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton("💭 Tchat telegram", url="https://t.me/+dzjwvg5XKqNkZWE0")
+        ],
+
+        [
+            InlineKeyboardButton("🥔 Canal potato", url="https://doudlj.org/joinchat/QwqUM5gH7Q8VqO3SnS4YwA")
+        ],
+
+        [
+            InlineKeyboardButton("🔒 Session", callback_data="show_info_potato")
+        ],
+
+        [
+            InlineKeyboardButton("👻 Snapchat", url="https://www.snapchat.com/add/lapharmacie6933?share_id=TCLVcQ_TWlk&locale=fr-FR")
+        ],
+        [InlineKeyboardButton("🔙 Retour", callback_data="back_to_home")]
+    ]
+
+    await query.edit_message_text(
+        "🌐 Voici nos réseaux :",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande pour accéder au menu d'administration"""
+    if str(update.effective_user.id) in ADMIN_IDS:
+        # Supprimer le message /admin
+        await update.message.delete()
+        
+        # Supprimer les anciens messages si leurs IDs sont stockés
+        messages_to_delete = ['menu_message_id', 'banner_message_id', 'category_message_id', 
+                            'last_product_message_id', 'instruction_message_id']
+        
+        for message_key in messages_to_delete:
+            if message_key in context.user_data:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data[message_key]
+                    )
+                    del context.user_data[message_key]
+                except Exception as e:
+                    print(f"Erreur lors de la suppression du message {message_key}: {e}")
+        
+        # Envoyer la bannière d'abord si elle existe
+        if CONFIG.get('banner_image'):
+            try:
+                banner_message = await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=CONFIG['banner_image']
+                )
+                context.user_data['banner_message_id'] = banner_message.message_id
+            except Exception as e:
+                print(f"Erreur lors de l'envoi de la bannière: {e}")
+        
+        return await show_admin_menu(update, context)
+    else:
+        await update.message.reply_text("❌ Vous n'êtes pas autorisé à accéder au menu d'administration.")
+        return ConversationHandler.END
+
+async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu d'administration"""
+    is_enabled = access_manager.is_access_code_enabled()
+    status_text = "✅ Activé" if is_enabled else "❌ Désactivé"
+    info_status = "✅ Activé" if CONFIG.get('info_button_enabled', True) else "❌ Désactivé"
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Ajouter une catégorie", callback_data="add_category")],
+        [InlineKeyboardButton("➕ Ajouter un produit", callback_data="add_product")],
+        [InlineKeyboardButton("❌ Supprimer une catégorie", callback_data="delete_category")],
+        [InlineKeyboardButton("❌ Supprimer un produit", callback_data="delete_product")],
+        [InlineKeyboardButton("✏️ Modifier une catégorie", callback_data="edit_category")],
+        [InlineKeyboardButton("✏️ Modifier un produit", callback_data="edit_product")],
+        [InlineKeyboardButton("🎯 Gérer boutons accueil", callback_data="show_custom_buttons")],
+        [InlineKeyboardButton("👥 Gérer les groupes", callback_data="manage_groups")],
+        [InlineKeyboardButton(f"🔒 Code d'accès: {status_text}", callback_data="toggle_access_code")],
+        [InlineKeyboardButton("📊 Statistiques", callback_data="show_stats")],
+        [InlineKeyboardButton("🛒 Modifier bouton Commander", callback_data="edit_order_button")],
+        [InlineKeyboardButton("🏠 Modifier message d'accueil", callback_data="edit_welcome")],  
+        [InlineKeyboardButton("🖼️ Modifier image bannière", callback_data="edit_banner_image")],
+        [InlineKeyboardButton("📢 Gestion annonces", callback_data="manage_broadcasts")],
+        [InlineKeyboardButton("🔙 Retour à l'accueil", callback_data="back_to_home")]
+    ]
+    keyboard = await admin_features.add_user_buttons(keyboard)
+
+    admin_text = (
+        "🔧 *Menu d'administration*\n\n"
+        "Sélectionnez une action à effectuer :"
+    )
+
+    try:
+        if update.callback_query:
+            message = await update.callback_query.edit_message_text(
+                admin_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            context.user_data['menu_message_id'] = message.message_id
+        else:
+            message = await update.message.reply_text(
+                admin_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            context.user_data['menu_message_id'] = message.message_id
+    except Exception as e:
+        print(f"Erreur dans show_admin_menu: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=admin_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    return CHOOSING
+
+async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le message d'information"""
+    query = update.callback_query
+    await query.answer()
+
+    info_text = CONFIG.get('info_message', 
+        "ℹ️ Aucune information n'a été configurée.\n"
+        "Les administrateurs peuvent ajouter des informations depuis le menu admin."
+    )
+
+    keyboard = [[InlineKeyboardButton("🔙 Retour", callback_data="back_to_home")]]
+
+    await query.edit_message_text(
+        text=info_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML'
+    )
+    return CHOOSING
+
+async def edit_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Démarre l'édition du message d'information"""
+    query = update.callback_query
+    await query.answer()
+
+    current_info = CONFIG.get('info_message', "Aucune information configurée.")
+    
+    await query.edit_message_text(
+        "📝 Envoyez le nouveau message d'information :\n"
+        "Vous pouvez utiliser le formatage HTML pour mettre en forme votre texte.\n\n"
+        "Message actuel :\n"
+        f"{current_info}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Annuler", callback_data="admin")
+        ]]),
+        parse_mode='HTML'
+    )
+    return WAITING_INFO_MESSAGE
+
+async def handle_info_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la réception du nouveau message d'information"""
+    new_info = update.message.text_html if hasattr(update.message, 'text_html') else update.message.text
+
+    # Sauvegarder le nouveau message dans la config
+    CONFIG['info_message'] = new_info
+    with open('config/config.json', 'w', encoding='utf-8') as f:
+        json.dump(CONFIG, f, indent=4)
+
+    # Supprimer le message de l'utilisateur et le message précédent
+    try:
+        await update.message.delete()
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id - 1
+        )
+    except Exception as e:
+        print(f"Erreur lors de la suppression des messages : {e}")
+
+    # Message de confirmation
+    success_msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="✅ Message d'information mis à jour avec succès !",
+        parse_mode='HTML'
+    )
+
+    # Attendre 3 secondes et supprimer le message de confirmation
+    await asyncio.sleep(3)
+    await success_msg.delete()
+
+    return await show_admin_menu(update, context)
+
+async def handle_new_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la modification du nom d'une catégorie"""
+    if str(update.message.from_user.id) not in ADMIN_IDS:
+        return
+
+    new_name = update.message.text
+    old_name = context.user_data.get('category_to_edit')
+
+    if old_name and old_name in CATALOG:
+        if new_name in CATALOG:
+            await update.message.reply_text(
+                "❌ Une catégorie avec ce nom existe déjà.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Retour", callback_data=f"edit_cat_{old_name}")
+                ]])
+            )
+            return EDITING_CATEGORY
+
+        # Sauvegarder les produits
+        products = CATALOG[old_name]
+        del CATALOG[old_name]
+        CATALOG[new_name] = products
+        save_catalog(CATALOG)
+
+        # Supprimer les messages précédents
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=update.message.message_id - 1
+            )
+            await update.message.delete()
+        except:
+            pass
+
+        # Message de confirmation
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Nom de la catégorie modifié avec succès!\n\n"
+                 f"*{old_name}* ➡️ *{new_name}*",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Retour au menu admin", callback_data="admin")
+            ]]),
+            parse_mode='Markdown'
+        )
+        return CHOOSING
+
+    return EDITING_CATEGORY
+    
+async def show_custom_buttons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu de gestion des boutons personnalisés"""
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Ajouter un bouton", callback_data="add_custom_button")],
+        [InlineKeyboardButton("❌ Supprimer un bouton", callback_data="list_buttons_delete")],
+        [InlineKeyboardButton("✏️ Modifier un bouton", callback_data="list_buttons_edit")],
+        [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+    ]
+
+    await query.edit_message_text(
+        "🔧 Gestion des boutons personnalisés\n\n"
+        "Choisissez une action :",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING
+
+async def start_add_custom_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commence le processus d'ajout d'un bouton personnalisé"""
+    query = update.callback_query
+    await query.answer()
+    
+    message = await query.edit_message_text(
+        "➕ Ajout d'un nouveau bouton\n\n"
+        "Envoyez le nom du bouton (exemple: '🌟 Mon Bouton') :",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Annuler", callback_data="show_custom_buttons")
+        ]])
+    )
+    
+    # Stocker l'ID du message pour le supprimer plus tard
+    context.user_data['messages_to_delete'] = [message.message_id]
+    
+    return WAITING_BUTTON_NAME
+
+async def handle_order_button_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Gère la configuration du bouton Commander"""
+        # Utiliser text_html pour capturer le formatage, sinon utiliser le texte normal
+        new_config = update.message.text_html if hasattr(update.message, 'text_html') else update.message.text.strip()
+    
+        try:
+            # Supprimer le message de l'utilisateur
+            await update.message.delete()
+        
+            # Mettre à jour la config selon le format
+            if new_config.startswith(('http://', 'https://')):
+                CONFIG['order_url'] = new_config
+                CONFIG['order_text'] = None
+                CONFIG['order_telegram'] = None
+                button_type = "URL"
+            # Vérifie si c'est un pseudo Telegram (avec ou sans @)
+            elif new_config.startswith('@') or not any(c in new_config for c in ' /?=&'):
+                # Enlever le @ si présent
+                username = new_config[1:] if new_config.startswith('@') else new_config
+                CONFIG['order_telegram'] = username
+                CONFIG['order_url'] = f"https://t.me/{username}"
+                CONFIG['order_text'] = None
+                button_type = "Telegram"
+            else:
+                CONFIG['order_text'] = new_config
+                CONFIG['order_url'] = None
+                CONFIG['order_telegram'] = None
+                button_type = "texte"
+            
+            # Sauvegarder dans config.json
+            with open('config/config.json', 'w', encoding='utf-8') as f:
+                json.dump(CONFIG, f, indent=4)
+        
+            # Supprimer l'ancien message si possible
+            if 'edit_order_button_message_id' in context.user_data:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['edit_order_button_message_id']
+                    )
+                except:
+                    pass
+        
+            # Message de confirmation avec le @ ajouté si c'est un pseudo Telegram sans @
+            display_value = new_config
+            if button_type == "Telegram" and not new_config.startswith('@'):
+                display_value = f"@{new_config}"
+            
+            success_message = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ Configuration du bouton Commander mise à jour avec succès!\n\n"
+                     f"Type: {button_type}\n"
+                     f"Valeur: {display_value}",
+                parse_mode='HTML'
+            )
+        
+            # Attendre 3 secondes puis supprimer le message de confirmation
+            await asyncio.sleep(3)
+            try:
+                await success_message.delete()
+            except:
+                pass
+        
+            return await show_admin_menu(update, context)
+        
+        except Exception as e:
+            print(f"Erreur dans handle_order_button_config: {e}")
+            return WAITING_ORDER_BUTTON_CONFIG
+
+async def handle_button_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la réception du nom du bouton"""
+    button_name = update.message.text
+    chat_id = update.effective_chat.id
+    
+    # Supprimer le message de l'utilisateur
+    await update.message.delete()
+    
+    # Supprimer tous les messages précédents stockés
+    messages_to_delete = context.user_data.get('messages_to_delete', [])
+    for msg_id in messages_to_delete:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message {msg_id}: {e}")
+    
+    # Mode création
+    context.user_data['temp_button'] = {'name': button_name}
+    
+    # Envoyer le nouveau message et stocker son ID pour suppression ultérieure
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text="Maintenant, envoyez :\n\n"
+             "- Une URL (commençant par http:// ou https://) pour créer un bouton de lien\n"
+             "- Ou du texte pour créer un bouton qui affichera ce texte",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Annuler", callback_data="show_custom_buttons")
+        ]])
+    )
+    
+    # Mettre à jour la liste des messages à supprimer
+    context.user_data['messages_to_delete'] = [message.message_id]
+    
+    return WAITING_BUTTON_VALUE
+
+async def start_edit_button_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commence l'édition du nom d'un bouton"""
+    query = update.callback_query
+    await query.answer()
+    
+    button_id = query.data.replace("edit_button_name_", "")
+    context.user_data['editing_button_id'] = button_id
+    
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    button = next((b for b in config.get('custom_buttons', []) if b['id'] == button_id), None)
+    
+    message = await query.edit_message_text(
+        f"✏️ Modification du nom du bouton\n\n"
+        f"Nom actuel : {button['name']}\n\n"
+        "Envoyez le nouveau nom :",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Annuler", callback_data=f"edit_button_{button_id}")
+        ]])
+    )
+    
+    # Initialiser ou réinitialiser la liste des messages à supprimer
+    context.user_data['messages_to_delete'] = [message.message_id]
+    
+    return WAITING_BUTTON_NAME
+
+async def start_edit_button_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commence l'édition de la valeur d'un bouton"""
+    query = update.callback_query
+    await query.answer()
+    
+    button_id = query.data.replace("edit_button_value_", "")
+    context.user_data['editing_button_id'] = button_id
+    
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    button = next((b for b in config.get('custom_buttons', []) if b['id'] == button_id), None)
+    
+    message = await query.edit_message_text(
+        f"✏️ Modification de la valeur du bouton\n\n"
+        f"Valeur actuelle : {button['value']}\n\n"
+        "Envoyez la nouvelle valeur :\n"
+        "• Pour un bouton URL : envoyez un lien commençant par http:// ou https://\n"
+        "• Pour un bouton texte : envoyez le texte à afficher",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Annuler", callback_data=f"edit_button_{button_id}")
+        ]])
+    )
+    
+    # Initialiser ou réinitialiser la liste des messages à supprimer
+    context.user_data['messages_to_delete'] = [message.message_id]
+    
+    return WAITING_BUTTON_VALUE
+
+async def handle_button_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la réception de la valeur du bouton"""
+    # Utiliser text_html s'il est disponible, sinon utiliser text normal
+    value = update.message.text_html if hasattr(update.message, 'text_html') else update.message.text
+    chat_id = update.effective_chat.id
+    
+    # Supprimer le message de l'utilisateur
+    await update.message.delete()
+    
+    # Supprimer tous les messages précédents stockés
+    messages_to_delete = context.user_data.get('messages_to_delete', [])
+    for msg_id in messages_to_delete:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message {msg_id}: {e}")
+    
+    is_url = value.startswith(('http://', 'https://'))
+    
+    if 'editing_button_id' in context.user_data:
+        # Mode édition
+        button_id = context.user_data['editing_button_id']
+        with open('config/config.json', 'r') as f:
+            config = json.load(f)
+        
+        for button in config.get('custom_buttons', []):
+            if button['id'] == button_id:
+                button['value'] = value
+                button['type'] = 'url' if is_url else 'text'
+                button['parse_mode'] = 'HTML' if not is_url else None  # Ajouter le parse_mode HTML si ce n'est pas une URL
+                break
+        
+        with open('config/config.json', 'w') as f:
+            json.dump(config, f, indent=4)
+        
+        # Envoyer le message de confirmation
+        reply_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text="✅ Valeur du bouton modifiée avec succès !",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")
+            ]])
+        )
+        
+        # Nettoyer les données utilisateur
+        context.user_data.clear()
+        return CHOOSING
+    
+    # Mode création
+    temp_button = context.user_data.get('temp_button', {})
+    
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    if 'custom_buttons' not in config:
+        config['custom_buttons'] = []
+    
+    button_id = f"button_{len(config['custom_buttons']) + 1}"
+    new_button = {
+        'id': button_id,
+        'name': temp_button.get('name', 'Bouton'),
+        'type': 'url' if is_url else 'text',
+        'value': value,
+        'parse_mode': 'HTML' if not is_url else None  # Ajouter le parse_mode HTML si ce n'est pas une URL
+    }
+    
+    config['custom_buttons'].append(new_button)
+    
+    with open('config/config.json', 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="✅ Bouton ajouté avec succès !",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")
+        ]])
+    )
+    return CHOOSING
+
+async def list_buttons_for_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Liste les boutons pour suppression"""
+    query = update.callback_query
+    await query.answer()
+    
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    buttons = config.get('custom_buttons', [])
+    if not buttons:
+        await query.edit_message_text(
+            "Aucun bouton personnalisé n'existe.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")
+            ]])
+        )
+        return CHOOSING
+    
+    keyboard = []
+    for button in buttons:
+        keyboard.append([InlineKeyboardButton(
+            f"❌ {button['name']}", 
+            callback_data=f"delete_button_{button['id']}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")])
+    
+    await query.edit_message_text(
+        "Sélectionnez le bouton à supprimer :",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING
+
+async def handle_button_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la suppression d'un bouton"""
+    query = update.callback_query
+    await query.answer()
+    
+    button_id = query.data.replace("delete_button_", "")
+    
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    config['custom_buttons'] = [b for b in config.get('custom_buttons', []) if b['id'] != button_id]
+    
+    with open('config/config.json', 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    await query.edit_message_text(
+        "✅ Bouton supprimé avec succès !",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")
+        ]])
+    )
+    return CHOOSING
+
+async def list_buttons_for_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Liste les boutons pour modification"""
+    query = update.callback_query
+    await query.answer()
+    
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    buttons = config.get('custom_buttons', [])
+    if not buttons:
+        await query.edit_message_text(
+            "Aucun bouton personnalisé n'existe.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")
+            ]])
+        )
+        return CHOOSING
+    
+    keyboard = []
+    for button in buttons:
+        keyboard.append([InlineKeyboardButton(
+            f"✏️ {button['name']}", 
+            callback_data=f"edit_button_{button['id']}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")])
+    
+    await query.edit_message_text(
+        "Sélectionnez le bouton à modifier :",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return CHOOSING
+
+async def handle_button_editing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la modification d'un bouton"""
+    query = update.callback_query
+    await query.answer()
+    
+    button_id = query.data.replace("edit_button_", "")
+    context.user_data['editing_button_id'] = button_id
+    
+    with open('config/config.json', 'r') as f:
+        config = json.load(f)
+    
+    button = next((b for b in config.get('custom_buttons', []) if b['id'] == button_id), None)
+    if button:
+        keyboard = [
+            [InlineKeyboardButton("✏️ Modifier le nom", callback_data=f"edit_button_name_{button_id}")],
+            [InlineKeyboardButton("🔗 Modifier la valeur", callback_data=f"edit_button_value_{button_id}")],
+            [InlineKeyboardButton("🔙 Retour", callback_data="list_buttons_edit")]
+        ]
+        
+        await query.edit_message_text(
+            f"Modification du bouton : {button['name']}\n"
+            f"Type actuel : {button['type']}\n"
+            f"Valeur actuelle : {button['value']}\n\n"
+            "Que souhaitez-vous modifier ?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING
+
+async def handle_banner_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère l'ajout de l'image bannière"""
+    if not update.message.photo:
+        await update.message.reply_text("Veuillez envoyer une photo.")
+        return WAITING_BANNER_IMAGE
+
+    # Supprimer le message précédent
+    if 'banner_msg' in context.user_data:
+        await context.bot.delete_message(
+            chat_id=context.user_data['banner_msg'].chat_id,
+            message_id=context.user_data['banner_msg'].message_id
+        )
+        del context.user_data['banner_msg']
+
+    # Obtenir l'ID du fichier de la photo
+    file_id = update.message.photo[-1].file_id
+    CONFIG['banner_image'] = file_id
+
+    # Sauvegarder la configuration
+    with open('config/config.json', 'w', encoding='utf-8') as f:
+        json.dump(CONFIG, f, indent=4)
+
+    # Supprimer le message contenant l'image
+    await update.message.delete()
+
+    thread_id = update.message.message_thread_id if update.message.is_topic_message else None
+
+    # Envoyer le message de confirmation
+    success_msg = await update.message.reply_text(
+        "✅ Image bannière mise à jour avec succès !",
+        message_thread_id=thread_id
+    )
+
+    # Attendre 3 secondes et supprimer le message
+    await asyncio.sleep(3)
+    await success_msg.delete()
+
+    # Supprimer l'ancienne bannière si elle existe
+    if 'banner_message_id' in context.user_data:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data['banner_message_id']
+            )
+        except:
+            pass
+
+    # Envoyer la nouvelle bannière
+    if CONFIG.get('banner_image'):
+        try:
+            banner_message = await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=CONFIG['banner_image']
+            )
+            context.user_data['banner_message_id'] = banner_message.message_id
+        except Exception as e:
+            print(f"Erreur lors de l'envoi de la bannière: {e}")
+
+    return await show_admin_menu(update, context)
+
+async def handle_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère l'ajout d'une nouvelle catégorie"""
+    category_name = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    # Vérifier les groupes de l'utilisateur
+    user_groups = []
+    selected_group = None
+    
+    # Récupérer tous les groupes de l'utilisateur
+    if "groups" in admin_features._access_codes:
+        for group_name, members in admin_features._access_codes["groups"].items():
+            if user_id in members:
+                user_groups.append(group_name)
+
+    # Si l'utilisateur est dans plusieurs groupes, lui demander de choisir
+    if len(user_groups) > 1:
+        keyboard = []
+        for group_name in user_groups:
+            keyboard.append([InlineKeyboardButton(
+                group_name,
+                callback_data=f"select_group_for_category_{group_name}_{category_name}"
+            )])
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="admin")])
+
+        await update.message.reply_text(
+            "📝 Dans quel groupe voulez-vous créer cette catégorie ?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING
+    elif len(user_groups) == 1:
+        # Si l'utilisateur n'est que dans un seul groupe
+        selected_group = user_groups[0]
+        category_name = f"{selected_group}_{category_name}"
+
+    # Vérifier si la catégorie existe déjà
+    if category_name in CATALOG:
+        await update.message.reply_text(
+            "❌ Cette catégorie existe déjà.\n"
+            "Veuillez choisir un autre nom :",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Annuler", callback_data="admin")
+            ]])
+        )
+        return WAITING_CATEGORY_NAME
+
+    # Ajouter la nouvelle catégorie
+    CATALOG[category_name] = []
+    save_catalog(CATALOG)
+
+    # Supprimer les messages
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id - 1
+        )
+        await update.message.delete()
+    except Exception as e:
+        print(f"Erreur lors de la suppression des messages: {e}")
+
+    # Message de confirmation
+    display_name = category_name.split("_", 1)[1] if "_" in category_name else category_name
+    keyboard = [
+        [InlineKeyboardButton("➕ Ajouter une autre catégorie", callback_data="add_category")],
+        [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+    ]
+    
+    message_text = (f"✅ Catégorie *{display_name}* créée avec succès"
+                   f"{f' dans le groupe *{selected_group}*' if selected_group else ''}!")
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    
+    return CHOOSING
+
+async def handle_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère l'entrée du nom du produit"""
+    product_name = update.message.text
+    category = context.user_data.get('temp_product_category')
+    user_id = update.effective_user.id
+    
+    # Vérifier si l'utilisateur est membre d'un groupe
+    user_groups = []
+    if "groups" in admin_features._access_codes:
+        for group_name, members in admin_features._access_codes["groups"].items():
+            if user_id in members:
+                user_groups.append(group_name)
+
+    # Si c'est une catégorie publique et que l'utilisateur est dans un groupe
+    if not any(category.startswith(f"{g}_") for g in admin_features._access_codes.get("groups", {}).keys()):
+        if user_groups:
+            # Ajouter le préfixe du premier groupe de l'utilisateur au nom du produit
+            product_name = f"{user_groups[0]}_{product_name}"
+
+    # Vérifier si la catégorie existe et contient SOLD OUT
+    if category in CATALOG and len(CATALOG[category]) == 1 and CATALOG[category][0].get('name') == 'SOLD OUT ! ❌':
+        CATALOG[category] = []  # Nettoyer la catégorie SOLD OUT
+        save_catalog(CATALOG)
+
+    if category and any(p.get('name') == product_name for p in CATALOG.get(category, [])):
+        await update.message.reply_text(
+            "❌ Ce produit existe déjà dans cette catégorie. Veuillez choisir un autre nom:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")
+            ]])
+        )
+        return WAITING_PRODUCT_NAME
+    
+    context.user_data['temp_product_name'] = product_name
+    
+    # Le reste de votre code reste identique
+    await context.bot.delete_message(
+        chat_id=update.effective_chat.id,
+        message_id=update.message.message_id - 1
+    )
+    
+    await update.message.reply_text(
+        "💰 Veuillez entrer le prix du produit:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")
+        ]])
+    )
+    
+    await update.message.delete()
+    
+    return WAITING_PRODUCT_PRICE
+
+async def handle_product_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère l'entrée du prix du produit"""
+    # Utiliser text_html pour capturer le formatage
+    price = update.message.text_html if hasattr(update.message, 'text_html') else update.message.text
+    context.user_data['temp_product_price'] = price
+    
+    # Supprimer le message précédent
+    await context.bot.delete_message(
+        chat_id=update.effective_chat.id,
+        message_id=update.message.message_id - 1
+    )
+    
+    await update.message.reply_text(
+        "📝 Veuillez entrer la description du produit:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")
+        ]])
+    )
+    
+    # Supprimer le message de l'utilisateur
+    await update.message.delete()
+    
+    return WAITING_PRODUCT_DESCRIPTION
+
+async def handle_product_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère l'entrée de la description du produit"""
+    # Utiliser text_html pour capturer le formatage
+    description = update.message.text_html if hasattr(update.message, 'text_html') else update.message.text
+    context.user_data['temp_product_description'] = description
+    
+    # Initialiser la liste des médias
+    context.user_data['temp_product_media'] = []
+    
+    # Supprimer le message précédent
+    await context.bot.delete_message(
+        chat_id=update.effective_chat.id,
+        message_id=update.message.message_id - 1
+    )
+    
+    # Envoyer et sauvegarder l'ID du message d'invitation
+    invitation_message = await update.message.reply_text(
+        "📸 Envoyez les photos ou vidéos du produit (plusieurs possibles)\n"
+        "Si vous ne voulez pas en envoyer, cliquez sur ignorer :",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏩ Ignorer", callback_data="skip_media")],
+            [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")]
+        ])
+    )
+    context.user_data['media_invitation_message_id'] = invitation_message.message_id
+    
+    # Supprimer le message de l'utilisateur
+    await update.message.delete()
+    
+    return WAITING_PRODUCT_MEDIA
+
+async def handle_product_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère l'ajout des médias (photos ou vidéos) du produit"""
+    if not (update.message.photo or update.message.video):
+        await update.message.reply_text("Veuillez envoyer une photo ou une vidéo.")
+        return WAITING_PRODUCT_MEDIA
+
+    if 'temp_product_media' not in context.user_data:
+        context.user_data['temp_product_media'] = []
+
+    if 'media_count' not in context.user_data:
+        context.user_data['media_count'] = 0
+
+    if context.user_data.get('media_invitation_message_id'):
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data['media_invitation_message_id']
+            )
+            del context.user_data['media_invitation_message_id']
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message d'invitation: {e}")
+
+    if context.user_data.get('last_confirmation_message_id'):
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=context.user_data['last_confirmation_message_id']
+            )
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message de confirmation: {e}")
+
+    context.user_data['media_count'] += 1
+
+    if update.message.photo:
+        media_id = update.message.photo[-1].file_id
+        media_type = 'photo'
+    else:
+        media_id = update.message.video.file_id
+        media_type = 'video'
+
+    new_media = {
+        'media_id': media_id,
+        'media_type': media_type,
+        'order_index': context.user_data['media_count']
+    }
+
+    context.user_data['temp_product_media'].append(new_media)
+
+    await update.message.delete()
+
+    message = await update.message.reply_text(
+        f"Photo/Vidéo {context.user_data['media_count']} ajoutée ! Cliquez sur Terminé pour valider :",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Terminé", callback_data="finish_media")],
+            [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")]
+        ])
+    )
+    context.user_data['last_confirmation_message_id'] = message.message_id
+
+    return WAITING_PRODUCT_MEDIA
+
+async def finish_product_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    category = context.user_data.get('temp_product_category')
+    
+    if not category:
+        return await show_admin_menu(update, context)
+
+    # Pour l'édition d'un produit existant
+    if context.user_data.get('editing_category'):
+        product_name = context.user_data.get('editing_product')
+        if product_name and category in CATALOG:
+            for product in CATALOG[category]:
+                if product['name'] == product_name:
+                    product['media'] = context.user_data.get('temp_product_media', [])
+                    save_catalog(CATALOG)
+                    break
+    else:
+        # Pour un nouveau produit
+        new_product = {
+            'name': context.user_data.get('temp_product_name'),
+            'price': context.user_data.get('temp_product_price'),
+            'description': context.user_data.get('temp_product_description'),
+            'media': context.user_data.get('temp_product_media', [])
+        }
+
+        # Vérifier si la catégorie est en SOLD OUT et la nettoyer si nécessaire
+        if category in CATALOG and len(CATALOG[category]) == 1 and CATALOG[category][0].get('name') == 'SOLD OUT ! ❌':
+            CATALOG[category] = []  # Nettoyer la catégorie SOLD OUT
+
+        # S'assurer que la catégorie existe dans CATALOG
+        if category not in CATALOG:
+            CATALOG[category] = []
+            
+        # Ajouter le nouveau produit
+        CATALOG[category].append(new_product)
+        save_catalog(CATALOG)
+
+    # Nettoyer les données temporaires
+    context.user_data.clear()
+
+    # Reste du code (keyboard, etc.)
+    keyboard = [
+        [InlineKeyboardButton("➕ Ajouter une catégorie", callback_data="add_category")],
+        [InlineKeyboardButton("➕ Ajouter un produit", callback_data="add_product")],
+        [InlineKeyboardButton("❌ Supprimer une catégorie", callback_data="delete_category")],
+        [InlineKeyboardButton("❌ Supprimer un produit", callback_data="delete_product")],
+        [InlineKeyboardButton("✏️ Modifier une catégorie", callback_data="edit_category")],
+        [InlineKeyboardButton("✏️ Modifier un produit", callback_data="edit_product")],
+        [InlineKeyboardButton("🎯 Gérer boutons accueil", callback_data="show_custom_buttons")],
+        [InlineKeyboardButton("👥 Gérer les groupes", callback_data="manage_groups")],
+        [InlineKeyboardButton(f"🔒 Code d'accès: {status_text}", callback_data="toggle_access_code")],
+        [InlineKeyboardButton("📊 Statistiques", callback_data="show_stats")],
+        [InlineKeyboardButton("🛒 Modifier bouton Commander", callback_data="edit_order_button")],
+        [InlineKeyboardButton("🏠 Modifier message d'accueil", callback_data="edit_welcome")],  
+        [InlineKeyboardButton("🖼️ Modifier image bannière", callback_data="edit_banner_image")],
+        [InlineKeyboardButton("📢 Gestion annonces", callback_data="manage_broadcasts")],
+        [InlineKeyboardButton("🔙 Retour à l'accueil", callback_data="back_to_home")]
+    ]
+
+    try:
+        await query.message.delete()
+    except:
+        pass
+
+    message = await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="🔧 *Menu d'administration*\n\n"
+             "✅ Médias mis à jour avec succès !\n\n"
+             "Sélectionnez une action à effectuer :",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    
+    context.user_data['menu_message_id'] = message.message_id
+    return CHOOSING
+
+async def handle_new_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Déclarer current_catalog en dehors du try
+    current_catalog = None
+    
+    try:
+        # Supprimer le message d'invite précédent
+        if 'last_bot_message' in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['last_bot_message']
+                )
+            except Exception as e:
+                print(f"Erreur lors de la suppression du message précédent: {e}")
+
+        # Supprimer le message de l'utilisateur
+        try:
+            await update.message.delete()
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message utilisateur: {e}")
+
+        field = context.user_data.get('editing_field')
+        category = context.user_data.get('editing_category')
+        old_product_name = context.user_data.get('editing_product')
+        new_value = update.message.text.strip()
+
+        # Vérifier que toutes les données nécessaires sont présentes
+        if not all([field, category, old_product_name]):
+            raise Exception("Données manquantes pour la modification")
+
+        # Si on modifie le nom, gérer le préfixe
+        if field == 'name':
+            current_prefix = ""
+            for group in admin_features._access_codes.get("groups", {}).keys():
+                if old_product_name.startswith(f"{group}_"):
+                    current_prefix = f"{group}_"
+                    break
+            
+            if current_prefix:
+                new_value = f"{current_prefix}{new_value}"
+
+        # Charger le catalogue actuel
+        current_catalog = load_catalog()  # Déplacé ici après la vérification des données
+
+        # Faire une copie des stats avant modification
+        stats = current_catalog.get('stats', {}).copy()  # Utiliser .copy() pour une copie profonde
+
+        # Trouver et modifier le produit
+        product_found = False
+        if category in current_catalog:
+            for i, product in enumerate(current_catalog[category]):
+                if isinstance(product, dict) and product.get('name') == old_product_name:
+                    # Créer une copie du produit et modifier la valeur
+                    updated_product = product.copy()
+                    updated_product[field] = new_value
+                    current_catalog[category][i] = updated_product
+                    product_found = True
+                    print(f"Produit trouvé et modifié: {json.dumps(updated_product, indent=2, ensure_ascii=False)}")
+                    break
+
+            if not product_found:
+                raise Exception(f"Produit '{old_product_name}' non trouvé dans la catégorie '{category}'")
+        else:
+            raise Exception(f"Catégorie '{category}' non trouvée dans le catalogue")
+
+        # Restaurer les stats
+        if 'stats' in current_catalog:
+            current_catalog['stats'] = stats
+
+        # Sauvegarder le catalogue
+        save_catalog(current_catalog)
+
+        # Mettre à jour les deux références au catalogue
+        global CATALOG
+        CATALOG = current_catalog
+        admin_features.CATALOG = current_catalog
+
+        # Message de confirmation
+        success_message = await update.message.reply_text(
+            f"✅ Nom modifié avec succès !"
+        )
+        
+        # Auto-destruction du message après 3 secondes
+        await asyncio.sleep(3)
+        try:
+            await success_message.delete()
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message de confirmation: {e}")
+
+        # Retourner au menu admin
+        return await show_admin_menu(update, context)
+
+    except Exception as e:
+        print(f"Erreur détaillée lors de la modification: {str(e)}")
+        error_message = await update.message.reply_text(
+            "❌ Une erreur est survenue lors de la modification.\n"
+            f"Détails: {str(e)}"
+        )
+        
+        # Auto-destruction du message d'erreur après 3 secondes
+        await asyncio.sleep(3)
+        try:
+            await error_message.delete()
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message d'erreur: {e}")
+            
+        return await show_admin_menu(update, context)
+
+async def handle_contact_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la modification du contact"""
+    new_value = update.message.text.strip()
+    
+    try:
+        # Supprimer le message de l'utilisateur
+        await update.message.delete()
+        
+        if new_value.startswith(('http://', 'https://')):
+            # C'est une URL
+            CONFIG['contact_url'] = new_value
+            CONFIG['contact_username'] = None
+            config_type = "URL"
+        else:
+            # C'est un pseudo Telegram
+            username = new_value.replace("@", "")
+            # Vérifier le format basique d'un username Telegram
+            if not bool(re.match(r'^[a-zA-Z0-9_]{5,32}$', username)):
+                if 'edit_contact_message_id' in context.user_data:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=context.user_data['edit_contact_message_id'],
+                        text="❌ Format d'username Telegram invalide.\n"
+                             "L'username doit contenir entre 5 et 32 caractères,\n"
+                             "uniquement des lettres, chiffres et underscores (_).\n\n"
+                             "Veuillez réessayer:",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit_contact")
+                        ]])
+                    )
+                return WAITING_CONTACT_USERNAME
+                
+            CONFIG['contact_username'] = username
+            CONFIG['contact_url'] = None
+            config_type = "Pseudo Telegram"
+        
+        # Sauvegarder dans config.json
+        with open('config/config.json', 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=4)
+        
+        # Supprimer l'ancien message de configuration
+        if 'edit_contact_message_id' in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['edit_contact_message_id']
+                )
+            except:
+                pass
+        
+        # Message de confirmation avec le @ ajouté si c'est un pseudo Telegram sans @
+        display_value = new_value
+        if config_type == "Pseudo Telegram" and not new_value.startswith('@'):
+            display_value = f"@{new_value}"
+        
+        success_message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Configuration du contact mise à jour avec succès!\n\n"
+                 f"Type: {config_type}\n"
+                 f"Valeur: {display_value}",
+            parse_mode='HTML'
+        )
+        
+        # Attendre 3 secondes puis supprimer le message de confirmation
+        await asyncio.sleep(3)
+        try:
+            await success_message.delete()
+        except:
+            pass
+        
+        return await show_admin_menu(update, context)
+        
+    except Exception as e:
+        print(f"Erreur dans handle_contact_username: {e}")
+        return WAITING_CONTACT_USERNAME
+
+async def handle_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la modification du message d'accueil"""
+    # Utiliser text_html pour capturer le formatage
+    new_message = update.message.text_html if hasattr(update.message, 'text_html') else update.message.text
+    
+    try:
+        # Supprimer le message de l'utilisateur
+        await update.message.delete()
+        
+        # Mettre à jour la config
+        CONFIG['welcome_message'] = new_message
+        
+        # Sauvegarder dans config.json
+        with open('config/config.json', 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=4)
+        
+        # Supprimer l'ancien message si possible
+        if 'edit_welcome_message_id' in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['edit_welcome_message_id']
+                )
+            except:
+                pass
+        
+        # Message de confirmation
+        success_message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"✅ Message d'accueil mis à jour avec succès!\n\n"
+                 f"Nouveau message :\n{new_message}",
+            parse_mode='HTML'
+        )
+        
+        # Attendre 3 secondes puis supprimer le message de confirmation
+        await asyncio.sleep(3)
+        try:
+            await success_message.delete()
+        except:
+            pass
+        
+        return await show_admin_menu(update, context)
+        
+    except Exception as e:
+        print(f"Erreur dans handle_welcome_message: {e}")
+        return WAITING_WELCOME_MESSAGE
+
+async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestion des boutons normaux"""
+    global paris_tz 
+    query = update.callback_query
+    await query.answer()
+    await admin_features.register_user(update.effective_user)
+
+
+    if query.data == "admin":
+        if str(update.effective_user.id) in ADMIN_IDS:
+            return await show_admin_menu(update, context)
+        else:
+            await query.edit_message_text("❌ Vous n'êtes pas autorisé à accéder au menu d'administration.")
+            return CHOOSING
+
+    elif query.data == "show_info_potato":
+        text = (
+            "🔒 <b>Voici notre ID Session pour passer commande :</b>\n\n"
+            "<code>051dafdaccdb8635e039f09f2206ab3be9a05d0bb5ec55d60a699192b5a5b4854e</code>"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Retour aux réseaux", callback_data="show_networks")]]
+        
+        await query.edit_message_text(
+            text=text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+        return CHOOSING
+
+    elif query.data.startswith("custom_text_"):
+        button_id = query.data.replace("custom_text_", "")
+        with open('config/config.json', 'r') as f:
+            config = json.load(f)
+        
+        button = next((b for b in config.get('custom_buttons', []) if b['id'] == button_id), None)
+        if button:
+            await query.edit_message_text(
+                button['value'],
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Retour", callback_data="back_to_home")
+                ]]),
+                parse_mode='HTML'
+            )
+        return CHOOSING
+
+    elif query.data == "show_custom_buttons":
+        if str(update.effective_user.id) not in ADMIN_IDS:
+            await query.answer("❌ Vous n'êtes pas autorisé à accéder à cette fonction.")
+            return CHOOSING
+
+        keyboard = [
+            [InlineKeyboardButton("➕ Ajouter un bouton", callback_data="add_custom_button")],
+            [InlineKeyboardButton("❌ Supprimer un bouton", callback_data="list_buttons_delete")],
+            [InlineKeyboardButton("✏️ Modifier un bouton", callback_data="list_buttons_edit")],
+            [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+        ]
+
+        await query.edit_message_text(
+            "🔧 Gestion des boutons personnalisés\n\n"
+            "Choisissez une action :",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'  # Ajout du parse_mode
+        )
+        return CHOOSING
+
+    elif query.data == "add_custom_button":
+        if str(update.effective_user.id) not in ADMIN_IDS:
+            await query.answer("Vous n'êtes pas autorisé à accéder à cette fonction.")
+            return CHOOSING
+
+        await query.edit_message_text(
+            "Ajout d'un nouveau bouton\n\n"
+            "Envoyez le nom du bouton (exemple: 'Mon Bouton') :",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Retour", callback_data="show_custom_buttons")
+            ]])
+        )
+        return WAITING_BUTTON_NAME
+
+    elif query.data == "list_buttons_delete":
+        if str(update.effective_user.id) not in ADMIN_IDS:
+            await query.answer("Vous n'êtes pas autorisé à accéder à cette fonction.")
+            return CHOOSING
+        
+        with open('config/config.json', 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        buttons = config.get('custom_buttons', [])
+        if not buttons:
+            await query.edit_message_text(
+                "Aucun bouton personnalise n'existe.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Retour", callback_data="show_custom_buttons")
+                ]])
+            )
+            return CHOOSING
+        
+        keyboard = []
+        for button in buttons:
+            keyboard.append([InlineKeyboardButton(
+                f"Supprimer {button['name']}", 
+                callback_data=f"delete_button_{button['id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("Retour", callback_data="show_custom_buttons")])
+        
+        await query.edit_message_text(
+            "Selectionnez le bouton a supprimer :",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING
+
+    elif query.data.startswith("delete_button_"):
+        if str(update.effective_user.id) not in ADMIN_IDS:
+            await query.answer("❌ Vous n'êtes pas autorisé à accéder à cette fonction.")
+            return CHOOSING
+        
+        button_id = query.data.replace("delete_button_", "")
+        
+        with open('config/config.json', 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        config['custom_buttons'] = [b for b in config.get('custom_buttons', []) if b['id'] != button_id]
+        
+        with open('config/config.json', 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+        
+        await query.edit_message_text(
+            "✅ Bouton supprimé avec succès !",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")
+            ]])
+        )
+        return CHOOSING
+
+    elif query.data == "list_buttons_edit":
+        if str(update.effective_user.id) not in ADMIN_IDS:
+            await query.answer("❌ Vous n'êtes pas autorisé à accéder à cette fonction.")
+            return CHOOSING
+        
+        with open('config/config.json', 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        buttons = config.get('custom_buttons', [])
+        if not buttons:
+            await query.edit_message_text(
+                "Aucun bouton personnalisé n'existe.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")
+                ]])
+            )
+            return CHOOSING
+        
+        keyboard = []
+        for button in buttons:
+            keyboard.append([InlineKeyboardButton(
+                f"✏️ {button['name']}", 
+                callback_data=f"edit_button_{button['id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="show_custom_buttons")])
+        
+        await query.edit_message_text(
+            "Sélectionnez le bouton à modifier :",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING
+
+    elif query.data.startswith("edit_button_"):
+        if str(update.effective_user.id) not in ADMIN_IDS:
+            await query.answer("❌ Vous n'êtes pas autorisé à accéder à cette fonction.")
+            return CHOOSING
+        
+        button_id = query.data.replace("edit_button_", "")
+        context.user_data['editing_button_id'] = button_id
+        
+        with open('config/config.json', 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        
+        button = next((b for b in config.get('custom_buttons', []) if b['id'] == button_id), None)
+        if button:
+            keyboard = [
+                [InlineKeyboardButton("✏️ Modifier le nom", callback_data=f"edit_button_name_{button_id}")],
+                [InlineKeyboardButton("🔗 Modifier la valeur", callback_data=f"edit_button_value_{button_id}")],
+                [InlineKeyboardButton("🔙 Retour", callback_data="list_buttons_edit")]
+            ]
+            
+            await query.edit_message_text(
+                f"Modification du bouton : {button['name']}\n"
+                f"Type actuel : {button['type']}\n"
+                f"Valeur actuelle : {button['value']}\n\n"
+                "Que souhaitez-vous modifier ?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return CHOOSING
+
+    elif query.data.startswith("edit_button_name_"):
+        button_id = query.data.replace("edit_button_name_", "")
+        context.user_data['editing_button_id'] = button_id
+        context.user_data['editing_button_field'] = 'name'
+        
+        await query.edit_message_text(
+            "✏️ Envoyez le nouveau nom du bouton :",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Annuler", callback_data=f"edit_button_{button_id}")
+            ]])
+        )
+        return WAITING_BUTTON_NAME
+
+    elif query.data.startswith("edit_button_value_"):
+        button_id = query.data.replace("edit_button_value_", "")
+        context.user_data['editing_button_id'] = button_id
+        context.user_data['editing_button_field'] = 'value'
+        
+        await query.edit_message_text(
+            "✏️ Envoyez la nouvelle valeur du bouton :\n\n"
+            "• Pour un bouton URL : envoyez un lien commençant par http:// ou https://\n"
+            "• Pour un bouton texte : envoyez le texte à afficher",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Annuler", callback_data=f"edit_button_{button_id}")
+            ]])
+        )
+        return WAITING_BUTTON_VALUE
+
+
+
+    elif query.data == "edit_banner_image":
+            msg = await query.message.edit_text(
+                "📸 Veuillez envoyer la nouvelle image bannière :",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")
+                ]])
+            )
+            context.user_data['banner_msg'] = msg
+            return WAITING_BANNER_IMAGE
+
+    elif query.data == "manage_users":
+        return await admin_features.handle_user_management(update, context)
+
+    elif query.data == "start_broadcast":
+        return await admin_features.handle_broadcast(update, context)
+
+    elif query.data == "add_category":
+        await query.message.edit_text(
+            "📝 Veuillez entrer le nom de la nouvelle catégorie:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_category")
+            ]])
+        )
+        return WAITING_CATEGORY_NAME
+
+    elif query.data == "add_product":
+        keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Fonction helper pour vérifier le SOLD OUT
+        def is_category_sold_out(cat_products):
+            return (len(cat_products) == 1 and 
+                    isinstance(cat_products[0], dict) and 
+                    cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Filtrer les catégories selon les groupes de l'utilisateur
+        for category in CATALOG.keys():
+            if category != 'stats':
+                if user_groups:
+                    # Pour les utilisateurs dans des groupes
+                    # 1. Montrer les catégories de leurs groupes
+                    for group_name in user_groups:
+                        if category.startswith(f"{group_name}_"):
+                            display_name = category.replace(f"{group_name}_", "")
+                            is_sold_out = is_category_sold_out(CATALOG[category])
+                            keyboard.append([InlineKeyboardButton(
+                                f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                                callback_data=f"select_category_{category}"
+                            )])
+                            break
+                    # 2. Montrer aussi les catégories publiques
+                    if not any(category.startswith(f"{g}_") for g in admin_features._access_codes.get("groups", {}).keys()):
+                        is_sold_out = is_category_sold_out(CATALOG[category])
+                        keyboard.append([InlineKeyboardButton(
+                            f"{category} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                            callback_data=f"select_category_{category}"
+                        )])
+                else:
+                    # Pour les utilisateurs sans groupe, montrer uniquement les catégories publiques
+                    show_category = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if category.startswith(f"{group_name}_"):
+                            show_category = False
+                            break
+                    if show_category:
+                        is_sold_out = is_category_sold_out(CATALOG[category])
+                        keyboard.append([InlineKeyboardButton(
+                            category, 
+                            callback_data=f"select_category_{category}"
+                        )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")])
+
+        await query.message.edit_text(
+            "📝 Sélectionnez la catégorie pour le nouveau produit:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_CATEGORY
+
+    elif query.data.startswith("select_category_"):
+        # Ne traiter que si ce n'est PAS une action de suppression
+        if not query.data.startswith("select_category_to_delete_"):
+            category = query.data.replace("select_category_", "")
+            context.user_data['temp_product_category'] = category
+            
+            await query.message.edit_text(
+                "📝 Veuillez entrer le nom du nouveau produit:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")
+                ]])
+            )
+            return WAITING_PRODUCT_NAME
+
+    elif query.data.startswith("delete_product_category_"):
+        category = query.data.replace("delete_product_category_", "")
+        products = CATALOG.get(category, [])
+    
+        keyboard = []
+        for product in products:
+            if isinstance(product, dict):
+                keyboard.append([
+                    InlineKeyboardButton(
+                        product['name'],
+                        callback_data=f"confirm_delete_product_{category[:10]}_{product['name'][:20]}"
+                    )
+                ])
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_delete_product")])
+    
+        await query.message.edit_text(
+            f"⚠️ Sélectionnez le produit à supprimer de *{category}* :",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return SELECTING_PRODUCT_TO_DELETE
+
+    elif query.data == "delete_category":
+        keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Filtrer les catégories selon les groupes de l'utilisateur
+        for category in CATALOG.keys():
+            if category != 'stats':
+                # Pour les utilisateurs dans des groupes
+                if user_groups:
+                    # 1. Afficher leurs catégories de groupe
+                    for group_name in user_groups:
+                        if category.startswith(f"{group_name}_"):
+                            display_name = category.replace(f"{group_name}_", "")
+                            keyboard.append([InlineKeyboardButton(
+                                display_name,
+                                callback_data=f"confirm_delete_category_{category}"
+                            )])
+                            break
+                    # 2. Afficher aussi les catégories publiques
+                    if not any(category.startswith(f"{g}_") for g in admin_features._access_codes.get("groups", {}).keys()):
+                        keyboard.append([InlineKeyboardButton(
+                            category,
+                            callback_data=f"confirm_delete_category_{category}"
+                        )])
+                else:
+                    # Pour les utilisateurs sans groupe, montrer uniquement les catégories publiques
+                    show_category = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if category.startswith(f"{group_name}_"):
+                            show_category = False
+                            break
+                    if show_category:
+                        keyboard.append([InlineKeyboardButton(
+                            category,
+                            callback_data=f"confirm_delete_category_{category}"
+                        )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="admin")])
+
+        await query.edit_message_text(
+            "⚠️ Sélectionnez la catégorie à supprimer:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_CATEGORY_TO_DELETE
+
+    elif query.data.startswith("confirm_delete_category_"):
+        category = query.data.replace("confirm_delete_category_", "")
+    
+        if category in CATALOG:
+            # Vérifier que l'utilisateur a le droit de supprimer cette catégorie
+            user_id = query.from_user.id
+            can_delete = True
+        
+            # Si la catégorie appartient à un groupe
+            for group_name in admin_features._access_codes.get("groups", {}).keys():
+                if category.startswith(f"{group_name}_"):
+                    # Vérifier si l'utilisateur est dans ce groupe
+                    if user_id not in admin_features._access_codes["groups"][group_name]:
+                        can_delete = False
+                    break
+
+            if can_delete:
+                del CATALOG[category]
+                save_catalog(CATALOG)
+            
+                # Afficher le nom de la catégorie sans le préfixe du groupe
+                display_name = category.split("_")[-1] if "_" in category else category
+            
+                keyboard = [
+                    [InlineKeyboardButton("🗑️ Supprimer une autre catégorie", callback_data="delete_category")],
+                    [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+                ]
+            
+                await query.edit_message_text(
+                    f"✅ Catégorie *{display_name}* supprimée avec succès!",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+            else:
+                await query.edit_message_text(
+                    "❌ Vous n'avez pas les droits pour supprimer cette catégorie.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Retour", callback_data="admin")
+                    ]])
+                )
+        else:
+            await query.edit_message_text(
+                "❌ Cette catégorie n'existe plus.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Retour", callback_data="admin")
+                ]])
+            )
+        return CHOOSING
+
+    elif query.data == "delete_product":
+        keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Filtrer les catégories selon les groupes de l'utilisateur
+        for category in CATALOG.keys():
+            if category != 'stats':
+                if user_groups:
+                    # Pour les utilisateurs dans des groupes
+                    # 1. Afficher leurs catégories de groupe
+                    for group_name in user_groups:
+                        if category.startswith(f"{group_name}_"):
+                            display_name = category.replace(f"{group_name}_", "")
+                            keyboard.append([InlineKeyboardButton(
+                                display_name, 
+                                callback_data=f"delete_product_category_{category}"
+                            )])
+                            break
+                    # 2. Afficher aussi les catégories publiques
+                    if not any(category.startswith(f"{g}_") for g in admin_features._access_codes.get("groups", {}).keys()):
+                        keyboard.append([InlineKeyboardButton(
+                            category, 
+                            callback_data=f"delete_product_category_{category}"
+                        )])
+                else:
+                    # Pour les utilisateurs sans groupe, montrer uniquement les catégories publiques
+                    show_category = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if category.startswith(f"{group_name}_"):
+                            show_category = False
+                            break
+                    if show_category:
+                        keyboard.append([InlineKeyboardButton(
+                            category, 
+                            callback_data=f"delete_product_category_{category}"
+                        )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_delete_product")])
+
+        await query.message.edit_text(
+            "⚠️ Sélectionnez la catégorie du produit à supprimer:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_CATEGORY_TO_DELETE
+
+    elif query.data.startswith("confirm_delete_product_"):
+            try:
+                # Extraire la catégorie et le nom du produit
+                parts = query.data.replace("confirm_delete_product_", "").split("_")
+                short_category = parts[0]
+                short_product = "_".join(parts[1:])  # Pour gérer les noms avec des underscores
+                
+                # Trouver la vraie catégorie et le vrai produit
+                category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
+                if category:
+                    product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
+                    if product_name:
+                        # Créer le clavier de confirmation avec les noms courts
+                        keyboard = [
+                            [
+                                InlineKeyboardButton("✅ Oui, supprimer", 
+                                    callback_data=f"really_delete_product_{category[:10]}_{product_name[:20]}"),
+                                InlineKeyboardButton("❌ Non, annuler", 
+                                    callback_data="cancel_delete_product")
+                            ]
+                        ]
+                    
+                        await query.message.edit_text(
+                            f"⚠️ *Êtes-vous sûr de vouloir supprimer le produit* `{product_name}` *?*\n\n"
+                            f"Cette action est irréversible !",
+                            reply_markup=InlineKeyboardMarkup(keyboard),
+                            parse_mode='Markdown'
+                        )
+                        return SELECTING_PRODUCT_TO_DELETE
+
+            except Exception as e:
+                print(f"Erreur lors de la confirmation de suppression: {e}")
+                return await show_admin_menu(update, context)
+
+    elif query.data.startswith("really_delete_product_"):
+        try:
+            parts = query.data.replace("really_delete_product_", "").split("_")
+            short_category = parts[0]
+            short_product = "_".join(parts[1:])
+
+            # Trouver la vraie catégorie et le vrai produit
+            category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
+            if category:
+                product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
+                if product_name:
+                    CATALOG[category] = [p for p in CATALOG[category] if p['name'] != product_name]
+                    save_catalog(CATALOG)
+                    await query.message.edit_text(
+                        f"✅ Le produit *{product_name}* a été supprimé avec succès !",
+                        parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")
+                        ]])
+                    )
+            return CHOOSING
+
+        except Exception as e:
+            print(f"Erreur lors de la suppression du produit: {e}")
+            return await show_admin_menu(update, context)
+
+    elif query.data == "edit_category":
+        if str(query.from_user.id) in ADMIN_IDS:
+            keyboard = []
+            user_id = query.from_user.id
+            user_groups = []
+    
+            # Fonction helper pour vérifier le SOLD OUT
+            def is_category_sold_out(cat_products):
+                return (len(cat_products) == 1 and 
+                        isinstance(cat_products[0], dict) and 
+                        cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+            # Récupérer les groupes de l'utilisateur
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members:
+                        user_groups.append(group_name)
+
+            # Filtrer les catégories selon les groupes de l'utilisateur
+            for category in CATALOG.keys():
+                if category != 'stats':
+                    if user_groups:
+                        # Pour les utilisateurs dans des groupes, montrer uniquement leurs catégories
+                        for group_name in user_groups:
+                            if category.startswith(f"{group_name}_"):
+                                display_name = category.replace(f"{group_name}_", "")
+                                is_sold_out = is_category_sold_out(CATALOG[category])
+                                keyboard.append([InlineKeyboardButton(
+                                    f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}",
+                                    callback_data=f"edit_cat_{category}"
+                                )])
+                                break
+                    else:
+                        # Pour les utilisateurs sans groupe, montrer uniquement les catégories publiques
+                        show_category = True
+                        for group_name in admin_features._access_codes.get("groups", {}).keys():
+                            if category.startswith(f"{group_name}_"):
+                                show_category = False
+                                break
+                        if show_category:
+                            is_sold_out = is_category_sold_out(CATALOG[category])
+                            keyboard.append([InlineKeyboardButton(
+                                f"{category} {'(SOLD OUT ❌)' if is_sold_out else ''}",
+                                callback_data=f"edit_cat_{category}"
+                            )])
+
+            keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="admin")])
+            await query.message.edit_text(
+                "Choisissez une catégorie à modifier:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return CHOOSING
+
+    elif query.data.startswith("edit_cat_"):
+        if str(query.from_user.id) in ADMIN_IDS:
+            if query.data.startswith("edit_cat_name_"):
+                # Gestion de la modification du nom
+                category = query.data.replace("edit_cat_name_", "")
+                # Obtenir le nom d'affichage (sans préfixe de groupe)
+                display_name = category
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if category.startswith(f"{group_name}_"):
+                        display_name = category.replace(f"{group_name}_", "")
+                        break
+
+                context.user_data['category_to_edit'] = category
+                await query.message.edit_text(
+                    f"📝 *Modification du nom de catégorie*\n\n"
+                    f"Catégorie actuelle : *{display_name}*\n\n"
+                    f"✍️ Envoyez le nouveau nom pour cette catégorie :",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Retour", callback_data=f"edit_cat_{category}")
+                    ]]),
+                    parse_mode='Markdown'
+                )
+                return WAITING_NEW_CATEGORY_NAME
+            else:
+                # Menu d'édition de catégorie
+                category = query.data.replace("edit_cat_", "")
+                # Obtenir le nom d'affichage (sans préfixe de groupe)
+                display_name = category
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if category.startswith(f"{group_name}_"):
+                        display_name = category.replace(f"{group_name}_", "")
+                        break
+
+                keyboard = [
+                    [InlineKeyboardButton("✏️ Modifier le nom", callback_data=f"edit_cat_name_{category}")],
+                    [InlineKeyboardButton("➕ Ajouter SOLD OUT", callback_data=f"add_soldout_{category}")],
+                    [InlineKeyboardButton("🔙 Retour", callback_data="edit_category")]
+                ]
+                await query.message.edit_text(
+                    f"Que voulez-vous modifier pour la catégorie *{display_name}* ?",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+                return CHOOSING
+
+    elif query.data.startswith("edit_cat_name_"):
+        if str(query.from_user.id) in ADMIN_IDS:
+            category = query.data.replace("edit_cat_name_", "")
+            context.user_data['category_to_edit'] = category
+            await query.message.edit_text(
+                f"📝 *Modification du nom de catégorie*\n\n"
+                f"Catégorie actuelle : *{category}*\n\n"
+                f"✍️ Envoyez le nouveau nom pour cette catégorie :",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Retour", callback_data=f"edit_cat_{category}")
+                ]]),
+                parse_mode='Markdown'
+            )
+            return WAITING_NEW_CATEGORY_NAME
+
+
+    elif query.data.startswith("add_soldout_"):
+        if str(query.from_user.id) in ADMIN_IDS:
+            category = query.data.replace("add_soldout_", "")
+            # Obtenir le nom d'affichage
+            display_name = category
+            for group_name in admin_features._access_codes.get("groups", {}).keys():
+                if category.startswith(f"{group_name}_"):
+                    display_name = category.replace(f"{group_name}_", "")
+                    break
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Oui, mettre en SOLD OUT", callback_data=f"confirm_soldout_{category}"),
+                    InlineKeyboardButton("❌ Non, annuler", callback_data=f"edit_cat_{category}")
+                ]
+            ]
+            await query.message.edit_text(
+                f"⚠️ *Attention!*\n\n"
+                f"Vous êtes sur le point de mettre la catégorie *{display_name}* en SOLD OUT.\n\n"
+                f"❗ *Cela supprimera tous les produits existants* dans cette catégorie.\n\n"
+                f"Êtes-vous sûr de vouloir continuer?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            return EDITING_CATEGORY
+
+    elif query.data.startswith("confirm_soldout_"):
+        if str(query.from_user.id) in ADMIN_IDS:
+            category = query.data.replace("confirm_soldout_", "")
+            # Vider la catégorie et ajouter le produit SOLD OUT
+            CATALOG[category] = [{
+                'name': 'SOLD OUT ! ❌',
+                'price': 'Non disponible',
+                'description': 'Cette catégorie est temporairement en rupture de stock.',
+                'media': []
+            }]
+            save_catalog(CATALOG)
+            await query.answer("✅ SOLD OUT ajouté avec succès!")
+            
+            # Retourner au menu d'édition des catégories
+            keyboard = []
+            # Filtrer les catégories selon les groupes de l'utilisateur
+            user_id = query.from_user.id
+            user_groups = []
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members:
+                        user_groups.append(group_name)
+
+            for cat in CATALOG.keys():
+                if cat != 'stats':
+                    show_category = False
+                    display_name = cat
+                
+                    if user_groups:
+                        # Pour les utilisateurs dans des groupes
+                        for group_name in user_groups:
+                            if cat.startswith(f"{group_name}_"):
+                                display_name = cat.replace(f"{group_name}_", "")
+                                show_category = True
+                                break
+                    else:
+                        # Pour les utilisateurs sans groupe
+                        show_category = not any(cat.startswith(f"{g}_") 
+                                             for g in admin_features._access_codes.get("groups", {}).keys())
+
+                    if show_category:
+                        keyboard.append([InlineKeyboardButton(
+                            f"{display_name} {'(SOLD OUT ❌)' if not CATALOG[cat] or (len(CATALOG[cat]) == 1 and CATALOG[cat][0].get('name') == 'SOLD OUT ! ❌') else ''}",
+                            callback_data=f"edit_cat_{cat}"
+                        )])
+
+            keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="admin")])
+            await query.message.edit_text(
+                "Choisissez une catégorie à modifier:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return EDITING_CATEGORY
+
+    elif query.data == "toggle_access_code":
+            if str(update.effective_user.id) not in ADMIN_IDS:
+                await query.answer("❌ Vous n'êtes pas autorisé à modifier ce paramètre.")
+                return CHOOSING
+            
+            is_enabled = access_manager.toggle_access_code()
+            status = "activé ✅" if is_enabled else "désactivé ❌"
+        
+            # Afficher un message temporaire
+            await query.answer(f"Le système de code d'accès a été {status}")
+        
+            # Rafraîchir le menu admin
+            return await show_admin_menu(update, context)
+
+    elif query.data == "edit_order_button":
+            # Gérer l'affichage des configurations actuelles
+            if CONFIG.get('order_url'):
+                current_config = CONFIG['order_url']
+                config_type = "URL"
+            elif CONFIG.get('order_text'):
+                current_config = CONFIG['order_text']
+                config_type = "Texte"
+            else:
+                current_config = 'Non configuré'
+                config_type = "Aucune"
+
+            message = await query.message.edit_text(
+                "🛒 Configuration du bouton Commander 🛒\n\n"
+                f"<b>Configuration actuelle</b> ({config_type}):\n"
+                f"{current_config}\n\n"
+                "Vous pouvez :\n"
+                "• Envoyer un pseudo Telegram (avec ou sans @)\n\n"
+                "• Envoyer un message avec formatage HTML (<b>gras</b>, <i>italique</i>, etc)\n\n"
+                "• Envoyer une URL (commençant par http:// ou https://) pour rediriger vers un site",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit_order")
+                ]]),
+                parse_mode='HTML'  # Ajout du support HTML
+            )
+            context.user_data['edit_order_button_message_id'] = message.message_id
+            return WAITING_ORDER_BUTTON_CONFIG
+
+    elif query.data == "show_order_text":
+        try:
+            # Récupérer le message de commande configuré
+            order_text = CONFIG.get('order_text', "Aucun message configuré")
+        
+            # Extraire la catégorie du message précédent
+            category = None
+            for markup_row in query.message.reply_markup.inline_keyboard:
+                for button in markup_row:
+                    if button.callback_data and button.callback_data.startswith("view_"):
+                        category = button.callback_data.replace("view_", "")
+                        break
+                if category:
+                    break
+        
+            keyboard = [[
+                InlineKeyboardButton("🔙 Retour aux produits", callback_data=f"view_{category}")
+            ]]
+        
+            # Modifier le message existant au lieu d'en créer un nouveau
+            # Utiliser parse_mode='HTML' au lieu de 'Markdown'
+            await query.message.edit_text(
+                text=order_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+            return CHOOSING
+        
+        except Exception as e:
+            print(f"Erreur lors de l'affichage du message: {e}")
+            await query.answer("Une erreur est survenue lors de l'affichage du message", show_alert=True)
+            return CHOOSING
+
+
+    elif query.data == "edit_welcome":
+            current_message = CONFIG.get('welcome_message', "Message non configuré")
+        
+            message = await query.message.edit_text(
+                "✏️ Configuration du message d'accueil\n\n"
+                f"Message actuel :\n{current_message}\n\n"
+                "Envoyez le nouveau message d'accueil.\n"
+                "Vous pouvez utiliser le formatage HTML :\n"
+                "• <b>texte</b> pour le gras\n"
+                "• <i>texte</i> pour l'italique\n"
+                "• <u>texte</u> pour le souligné",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit_welcome")
+                ]]),
+                parse_mode='HTML'
+            )
+            context.user_data['edit_welcome_message_id'] = message.message_id
+            return WAITING_WELCOME_MESSAGE
+
+    elif query.data == "show_stats":
+        # Configuration du fuseau horaire Paris
+        paris_tz = pytz.timezone('Europe/Paris')
+        utc_now = datetime.utcnow()
+        paris_now = utc_now.replace(tzinfo=pytz.UTC).astimezone(paris_tz)
+
+        # Initialisation des stats si nécessaire
+        if 'stats' not in CATALOG:
+            CATALOG['stats'] = {
+                "total_views": 0,
+                "category_views": {},
+                "product_views": {},
+                "last_updated": paris_now.strftime("%H:%M:%S"),
+                "last_reset": paris_now.strftime("%Y-%m-%d")
+            }
+    
+        # Nettoyer les stats avant l'affichage
+        clean_stats()
+    
+        stats = CATALOG['stats']
+        text = "📊 *Statistiques du catalogue*\n\n"
+        text += f"👥 Vues totales: {stats.get('total_views', 0)}\n"
+    
+        # Conversion de l'heure en fuseau horaire Paris
+        last_updated = stats.get('last_updated', 'Jamais')
+        if last_updated != 'Jamais':
+            try:
+                if len(last_updated) > 8:  # Si format complet
+                    dt = datetime.strptime(last_updated, "%Y-%m-%d %H:%M:%S")
+                else:  # Si format HH:MM:SS
+                    today = paris_now.strftime("%Y-%m-%d")
+                    dt = datetime.strptime(f"{today} {last_updated}", "%Y-%m-%d %H:%M:%S")
+            
+                # Convertir en timezone Paris
+                dt = dt.replace(tzinfo=pytz.UTC).astimezone(paris_tz)
+                last_updated = dt.strftime("%H:%M:%S")
+            except Exception as e:
+                print(f"Erreur conversion heure: {e}")
+            
+        text += f"🕒 Dernière mise à jour: {last_updated}\n"
+    
+        if 'last_reset' in stats:
+            text += f"🔄 Dernière réinitialisation: {stats.get('last_reset', 'Jamais')}\n"
+        text += "\n"
+    
+        # Le reste du code reste identique
+        text += "📈 *Vues par catégorie:*\n"
+        category_views = stats.get('category_views', {})
+        if category_views:
+            sorted_categories = sorted(category_views.items(), key=lambda x: x[1], reverse=True)
+            for category, views in sorted_categories:
+                if category in CATALOG:
+                    text += f"- {category}: {views} vues\n"
+        else:
+            text += "Aucune vue enregistrée.\n"
+
+        text += "\n━━━━━━━━━━━━━━━\n\n"
+    
+        text += "🔥 *Produits les plus populaires:*\n"
+        product_views = stats.get('product_views', {})
+        if product_views:
+            all_products = []
+            for category, products in product_views.items():
+                if category in CATALOG:
+                    existing_products = [p['name'] for p in CATALOG[category]]
+                    for product_name, views in products.items():
+                        if product_name in existing_products:
+                            all_products.append((category, product_name, views))
+        
+            sorted_products = sorted(all_products, key=lambda x: x[2], reverse=True)[:5]
+            for category, product_name, views in sorted_products:
+                text += f"- {product_name} ({category}): {views} vues\n"
+        else:
+            text += "Aucune vue enregistrée sur les produits.\n"
+    
+        keyboard = [
+            [InlineKeyboardButton("🔄 Réinitialiser les statistiques", callback_data="confirm_reset_stats")],
+            [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+        ]
+    
+        await query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    elif query.data == "edit_contact":
+            # Gérer l'affichage de la configuration actuelle
+            if CONFIG.get('contact_username'):
+                current_config = f"@{CONFIG['contact_username']}"
+                config_type = "Pseudo Telegram"
+            elif CONFIG.get('contact_url'):  # Ajout d'une nouvelle option pour l'URL
+                current_config = CONFIG['contact_url']
+                config_type = "URL"
+            else:
+                current_config = 'Non configuré'
+                config_type = "Aucune"
+
+            message = await query.message.edit_text(
+                "📱 Configuration du contact\n\n"
+                f"Configuration actuelle ({config_type}):\n"
+                f"{current_config}\n\n"
+                "Vous pouvez :\n"
+                "• Envoyer un pseudo Telegram (avec ou sans @)\n"
+                "• Envoyer une URL (commençant par http:// ou https://) pour rediriger vers un site",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit_contact")
+                ]]),
+                parse_mode='HTML'
+            )
+            context.user_data['edit_contact_message_id'] = query.message.message_id
+            return WAITING_CONTACT_USERNAME
+
+    elif query.data in ["cancel_add_category", "cancel_add_product", "cancel_delete_category", 
+                        "cancel_delete_product", "cancel_edit_contact", "cancel_edit_order", "cancel_edit_welcome"]:
+        return await show_admin_menu(update, context)
+
+    elif query.data == "back_to_categories":
+        if 'category_message_id' in context.user_data:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=context.user_data['category_message_id'],
+                    text=context.user_data['category_message_text'],
+                    reply_markup=InlineKeyboardMarkup(context.user_data['category_message_reply_markup']),
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                print(f"Erreur lors de la mise à jour du message des catégories: {e}")
+        else:
+            # Si le message n'existe pas, recréez-le
+            keyboard = []
+            for category in CATALOG.keys():
+                if category != 'stats':
+                    keyboard.append([InlineKeyboardButton(category, callback_data=f"view_{category}")])
+
+            keyboard.append([InlineKeyboardButton("🔙 Retour à l'accueil", callback_data="back_to_home")])
+
+            await query.edit_message_text(
+                "📋 *Menu*\n\n"
+                "Choisissez une catégorie pour voir les produits :",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+
+    elif query.data == "skip_media":
+        category = context.user_data.get('temp_product_category')
+        if category:
+            new_product = {
+                'name': context.user_data.get('temp_product_name'),
+                'price': context.user_data.get('temp_product_price'),
+                'description': context.user_data.get('temp_product_description')
+            }
+            
+            if category not in CATALOG:
+                CATALOG[category] = []
+            CATALOG[category].append(new_product)
+            save_catalog(CATALOG)
+            
+            context.user_data.clear()
+            return await show_admin_menu(update, context)
+
+    elif query.data.startswith("product_"):
+        try:
+            _, nav_id = query.data.split("_", 1)
+            # Récupérer les informations du produit à partir de l'ID stocké
+            product_info = context.user_data.get(f'nav_product_{nav_id}')
+        
+            if not product_info:
+                await query.answer("Produit non trouvé")
+                return
+
+            category = product_info['category']
+            product_name = product_info['name']
+        
+            # Récupérer le produit
+            product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
+
+            if product:
+                caption = f"📱 <b>{product['name']}</b>\n\n"
+                caption += f"💰 <b>Prix:</b>\n{product['price']}\n\n"
+                caption += f"📝 <b>Description:</b>\n{product['description']}"
+
+                keyboard = [[
+                    InlineKeyboardButton("🔙 Retour à la catégorie", callback_data=f"view_{category}"),
+                    InlineKeyboardButton(
+                        "🛒 Commander",
+                        **({'url': CONFIG['order_url']} if CONFIG.get('order_url') 
+                           else {'callback_data': "show_order_text"})
+                    )
+                ]]
+
+                if 'media' in product and product['media']:
+                    media_list = product['media']
+                    media_list = sorted(media_list, key=lambda x: x.get('order_index', 0))
+                    total_media = len(media_list)
+                    context.user_data['current_media_index'] = 0
+                    current_media = media_list[0]
+
+                    if total_media > 1:
+                        keyboard.insert(0, [
+                            InlineKeyboardButton("⬅️ Précédent", callback_data=f"prev_{nav_id}"),
+                            InlineKeyboardButton("➡️ Suivant", callback_data=f"next_{nav_id}")
+                        ])
+
+                    try:
+                        await query.message.delete()
+                    except Exception as e:
+                        print(f"Erreur lors de la suppression du message: {e}")
+
+                    try:
+                        if current_media['media_type'] == 'photo':
+                            try:
+                                message = await context.bot.send_photo(
+                                    chat_id=query.message.chat_id,
+                                    photo=current_media['media_id'],
+                                    caption=caption,
+                                    reply_markup=InlineKeyboardMarkup(keyboard),
+                                    parse_mode='HTML'
+                                )
+                            except Exception as e:
+                                print(f"Erreur d'envoi de photo: {e}")
+                                message = await context.bot.send_message(
+                                    chat_id=query.message.chat_id,
+                                    text=f"{caption}\n\n⚠️ L'image n'a pas pu être chargée",
+                                    reply_markup=InlineKeyboardMarkup(keyboard),
+                                    parse_mode='HTML'
+                                )
+                        else:  # video
+                            try:
+                                message = await context.bot.send_video(
+                                    chat_id=query.message.chat_id,
+                                    video=current_media['media_id'],
+                                    caption=caption,
+                                    reply_markup=InlineKeyboardMarkup(keyboard),
+                                    parse_mode='HTML'
+                                )
+                            except Exception as e:
+                                print(f"Erreur d'envoi de vidéo: {e}")
+                                message = await context.bot.send_message(
+                                    chat_id=query.message.chat_id,
+                                    text=f"{caption}\n\n⚠️ La vidéo n'a pas pu être chargée",
+                                    reply_markup=InlineKeyboardMarkup(keyboard),
+                                    parse_mode='HTML'
+                                )
+                        context.user_data['last_product_message_id'] = message.message_id
+                    except Exception as e:
+                        print(f"Erreur lors de l'envoi du média: {e}")
+                        await query.answer("Une erreur est survenue lors de l'affichage du média")
+
+                else:
+                    await query.message.edit_text(
+                        text=caption,
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode='HTML'
+                    )
+
+                # Incrémenter les stats du produit
+                if 'stats' not in CATALOG:
+                    CATALOG['stats'] = {
+                        "total_views": 0,
+                        "category_views": {},
+                        "product_views": {},
+                        "last_updated": datetime.now(paris_tz).strftime("%H:%M:%S")
+                    }
+
+                if 'product_views' not in CATALOG['stats']:
+                    CATALOG['stats']['product_views'] = {}
+                if category not in CATALOG['stats']['product_views']:
+                    CATALOG['stats']['product_views'][category] = {}
+                if product['name'] not in CATALOG['stats']['product_views'][category]:
+                    CATALOG['stats']['product_views'][category][product['name']] = 0
+
+                CATALOG['stats']['product_views'][category][product['name']] += 1
+                CATALOG['stats']['total_views'] += 1
+                CATALOG['stats']['last_updated'] = datetime.now(paris_tz).strftime("%H:%M:%S")
+                save_catalog(CATALOG)
+
+        except Exception as e:
+            print(f"Erreur lors de l'affichage du produit: {e}")
+            await query.answer("Une erreur est survenue")
+
+    elif query.data.startswith("view_"):
+        category = query.data.replace("view_", "")
+        if category in CATALOG:
+            # Initialisation des stats si nécessaire
+            if 'stats' not in CATALOG:
+                CATALOG['stats'] = {
+                    "total_views": 0,
+                    "category_views": {},
+                    "product_views": {},
+                    "last_updated": datetime.now(paris_tz).strftime("%H:%M:%S")
+                }
+
+            if 'category_views' not in CATALOG['stats']:
+                CATALOG['stats']['category_views'] = {}
+
+            if category not in CATALOG['stats']['category_views']:
+                CATALOG['stats']['category_views'][category] = 0
+
+            # Mettre à jour les statistiques
+            CATALOG['stats']['category_views'][category] += 1
+            CATALOG['stats']['total_views'] += 1
+            CATALOG['stats']['last_updated'] = datetime.now(paris_tz).strftime("%H:%M:%S")
+            save_catalog(CATALOG)
+
+            products = []
+            user_id = query.from_user.id
+
+            # Vérifier si c'est une catégorie de groupe
+            is_group_category = False
+            for group_name in admin_features._access_codes.get("groups", {}).keys():
+                if category.startswith(f"{group_name}_"):
+                    is_group_category = True
+                    # Vérifier si l'utilisateur est membre du groupe
+                    if user_id not in admin_features._access_codes["groups"][group_name]:
+                        await query.answer("❌ Vous n'avez pas accès à cette catégorie", show_alert=True)
+                        return CHOOSING
+                    break
+
+            # Filtrer les produits
+            for product in CATALOG[category]:
+                if is_group_category:
+                    # Dans une catégorie de groupe, montrer tous les produits
+                    products.append(product)
+                else:
+                    # Dans une catégorie publique, filtrer selon le groupe
+                    product_name = product['name']
+                    show_product = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if product_name.startswith(f"{group_name}_"):
+                            if user_id not in admin_features._access_codes["groups"][group_name]:
+                                show_product = False
+                            break
+                    if show_product:
+                        products.append(product)
+
+            # Obtenir le nom d'affichage pour la catégorie (sans préfixe)
+            display_category_name = category
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members and category.startswith(f"{group_name}_"):
+                        display_category_name = category.replace(f"{group_name}_", "")
+                        break
+
+            # Afficher la liste des produits
+            text = f"*{display_category_name}*\n\n"
+            keyboard = []
+            for product in products:
+                # Créer un ID court unique pour ce produit
+                nav_id = str(abs(hash(product['name'])) % 1000)
+                # Stocker les informations du produit avec cet ID
+                context.user_data[f'nav_product_{nav_id}'] = {
+                    'category': category,
+                    'name': product['name']
+                }
+                # Afficher le nom sans préfixe de groupe si nécessaire
+                display_name = product['name']
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if display_name.startswith(f"{group_name}_"):
+                        display_name = display_name.replace(f"{group_name}_", "")
+                        break
+                keyboard.append([InlineKeyboardButton(
+                    display_name,
+                    callback_data=f"product_{nav_id}"
+                )])
+
+            keyboard.append([InlineKeyboardButton("🔙 Retour au menu", callback_data="show_categories")])
+
+
+            try:
+                # Suppression du dernier message de produit (photo ou vidéo) si existe
+                if 'last_product_message_id' in context.user_data:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=query.message.chat_id,
+                            message_id=context.user_data['last_product_message_id']
+                        )
+                        del context.user_data['last_product_message_id']
+                    except:
+                        pass
+
+                print(f"Texte du message : {text}")
+                print(f"Clavier : {keyboard}")
+
+                # Éditer le message existant au lieu de le supprimer et recréer
+                await query.message.edit_text(
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+    
+                context.user_data['category_message_id'] = query.message.message_id
+                context.user_data['category_message_text'] = text
+                context.user_data['category_message_reply_markup'] = keyboard
+
+            except Exception as e:
+                print(f"Erreur lors de la mise à jour du message des produits: {e}")
+                # Si l'édition échoue, on crée un nouveau message
+                message = await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+                context.user_data['category_message_id'] = message.message_id
+
+            # Mettre à jour les stats des produits seulement s'il y en a
+            if products:
+                if 'stats' not in CATALOG:
+                    CATALOG['stats'] = {
+                        "total_views": 0,
+                        "category_views": {},
+                        "product_views": {},
+                        "last_updated": datetime.now(paris_tz).strftime("%H:%M:%S"),
+                        "last_reset": datetime.now(paris_tz).strftime("%Y-%m-%d")
+                    }
+
+                if 'product_views' not in CATALOG['stats']:
+                    CATALOG['stats']['product_views'] = {}
+                if category not in CATALOG['stats']['product_views']:
+                    CATALOG['stats']['product_views'][category] = {}
+
+                # Mettre à jour les stats pour chaque produit dans la catégorie
+                for product in products:
+                    if product['name'] not in CATALOG['stats']['product_views'][category]:
+                        CATALOG['stats']['product_views'][category][product['name']] = 0
+                    CATALOG['stats']['product_views'][category][product['name']] += 1
+
+                save_catalog(CATALOG)
+
+    elif query.data.startswith(("next_", "prev_")):
+        try:
+            direction, nav_id = query.data.split("_")
+            # Récupérer les informations du produit
+            product_info = context.user_data.get(f'nav_product_{nav_id}')
+            if not product_info:
+                await query.answer("Navigation expirée")
+                return
+        
+            category = product_info['category']
+            product_name = product_info['name']
+        
+            # Récupérer le produit
+            product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
+
+            if product and 'media' in product:
+                media_list = sorted(product['media'], key=lambda x: x.get('order_index', 0))
+                total_media = len(media_list)
+                current_index = context.user_data.get('current_media_index', 0)
+
+                # Navigation simple
+                if direction == "next":
+                    current_index = current_index + 1
+                    if current_index >= total_media:
+                        current_index = 0
+                else:  # prev
+                    current_index = current_index - 1
+                    if current_index < 0:
+                        current_index = total_media - 1
+
+                context.user_data['current_media_index'] = current_index
+                current_media = media_list[current_index]
+
+                caption = f"📱 <b>{product['name']}</b>\n\n"
+                caption += f"💰 <b>Prix:</b>\n{product['price']}\n\n"
+                caption += f"📝 <b>Description:</b>\n{product['description']}"
+
+                # Création des boutons avec l'ID court
+                keyboard = []
+                if total_media > 1:
+                    keyboard.append([
+                        InlineKeyboardButton("⬅️ Précédent", callback_data=f"prev_{nav_id}"),
+                        InlineKeyboardButton("➡️ Suivant", callback_data=f"next_{nav_id}")
+                    ])
+                keyboard.append([
+                    InlineKeyboardButton("🔙 Retour à la catégorie", callback_data=f"view_{category}"),
+                    InlineKeyboardButton(
+                        "🛒 Commander",
+                        **({'url': CONFIG.get('order_url')} if CONFIG.get('order_url') else {'callback_data': "show_order_text"})
+                    )
+                ])
+
+                try:
+                    await query.message.delete()
+                except Exception as e:
+                    print(f"Erreur lors de la suppression du message: {e}")
+
+                try:
+                    if current_media['media_type'] == 'photo':
+                        try:
+                            message = await context.bot.send_photo(
+                                chat_id=query.message.chat_id,
+                                photo=current_media['media_id'],
+                                caption=caption,
+                                reply_markup=InlineKeyboardMarkup(keyboard),
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            print(f"Erreur d'envoi de photo: {e}")
+                            message = await context.bot.send_message(
+                                chat_id=query.message.chat_id,
+                                text=f"{caption}\n\n⚠️ L'image n'a pas pu être chargée",
+                                reply_markup=InlineKeyboardMarkup(keyboard),
+                                parse_mode='HTML'
+                            )
+                    else:  # video
+                        try:
+                            message = await context.bot.send_video(
+                                chat_id=query.message.chat_id,
+                                video=current_media['media_id'],
+                                caption=caption,
+                                reply_markup=InlineKeyboardMarkup(keyboard),
+                                parse_mode='HTML'
+                            )
+                        except Exception as e:
+                            print(f"Erreur d'envoi de vidéo: {e}")
+                            message = await context.bot.send_message(
+                                chat_id=query.message.chat_id,
+                                text=f"{caption}\n\n⚠️ La vidéo n'a pas pu être chargée",
+                                reply_markup=InlineKeyboardMarkup(keyboard),
+                                parse_mode='HTML'
+                            )
+                    context.user_data['last_product_message_id'] = message.message_id
+                except Exception as e:
+                    print(f"Erreur lors de l'envoi du média: {e}")
+                    await query.answer("Une erreur est survenue lors de l'affichage du média")
+
+        except Exception as e:
+            print(f"Erreur lors de la navigation des médias: {e}")
+            await query.answer("Une erreur est survenue")
+
+    elif query.data == "edit_product":
+        keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Fonction helper pour vérifier si une catégorie est en SOLD OUT
+        def is_category_sold_out(cat_products):
+            return (len(cat_products) == 1 and 
+                    isinstance(cat_products[0], dict) and 
+                    cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+        # Filtrer les catégories
+        for category in CATALOG.keys():
+            if category != 'stats':
+                is_group_category = any(category.startswith(f"{group}_") 
+                                      for group in admin_features._access_codes.get("groups", {}).keys())
+                
+                if is_group_category:
+                    # Montrer les catégories du groupe de l'utilisateur
+                    if user_groups:
+                        for group_name in user_groups:
+                            if category.startswith(f"{group_name}_"):
+                                display_name = category.replace(f"{group_name}_", "")
+                                is_sold_out = is_category_sold_out(CATALOG[category])
+                                keyboard.append([InlineKeyboardButton(
+                                    f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                                    callback_data=f"editcat_{category}"
+                                )])
+                else:
+                    # Montrer les catégories publiques à tout le monde
+                    is_sold_out = is_category_sold_out(CATALOG[category])
+                    keyboard.append([InlineKeyboardButton(
+                        f"{category} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                        callback_data=f"editcat_{category}"
+                    )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")])
+
+        await query.message.edit_text(
+            "✏️ Sélectionnez la catégorie du produit à modifier:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_CATEGORY
+
+    elif query.data.startswith("editp_"):
+        try:
+            product_id = query.data.replace("editp_", "")
+            stored_data = context.user_data.get(f'callback_{product_id}')
+            
+            if not stored_data:
+                print(f"Données non trouvées pour l'ID {product_id}")
+                return await show_admin_menu(update, context)
+            
+            category = stored_data['category']
+            product_name = stored_data['product_name']
+            
+            # Vérifier que la catégorie existe et que l'utilisateur y a accès
+            user_id = query.from_user.id
+            has_access = False
+            display_name = product_name
+            group_prefix = ""
+            
+            # Vérifier les permissions
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if category.startswith(f"{group_name}_"):
+                        if user_id in members:
+                            has_access = True
+                            group_prefix = f"{group_name}_"
+                            display_name = product_name.replace(group_prefix, "", 1)
+                        break
+                if not has_access:
+                    # Si c'est une catégorie publique
+                    has_access = not any(category.startswith(f"{g}_") 
+                                       for g in admin_features._access_codes.get("groups", {}).keys())
+            else:
+                has_access = True  # Si pas de groupes configurés
+
+            if has_access and category in CATALOG:
+                product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
+                if product:
+                    context.user_data['editing_category'] = category
+                    context.user_data['editing_product'] = product_name
+
+                    # Construire le clavier pour l'édition
+                    keyboard = [
+                        [InlineKeyboardButton("📝 Nom", callback_data="edit_name")],
+                        [InlineKeyboardButton("💰 Prix", callback_data="edit_price")],
+                        [InlineKeyboardButton("📝 Description", callback_data="edit_desc")],
+                        [InlineKeyboardButton("📸 Médias", callback_data="edit_media")],
+                        [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")]
+                    ]
+
+                    await query.message.edit_text(
+                        f"✏️ Que souhaitez-vous modifier pour *{display_name}* ?\n"
+                        "Sélectionnez un champ à modifier:",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode='Markdown'
+                    )
+                    return EDITING_PRODUCT_FIELD
+                else:
+                    print(f"Produit non trouvé: {product_name}")
+            else:
+                print(f"Pas d'accès à la catégorie: {category}")
+                await query.answer("❌ Vous n'avez pas accès à ce produit", show_alert=True)
+
+            return await show_admin_menu(update, context)
+            
+        except Exception as e:
+            print(f"Erreur dans editp_: {e}")
+            traceback.print_exc()
+            return await show_admin_menu(update, context)
+
+    elif query.data.startswith("editcat_"):
+        category = query.data.replace("editcat_", "")
+        if category in CATALOG:
+            user_id = query.from_user.id
+            user_groups = []
+            user_group_prefix = ""
+            
+            # Récupérer les groupes de l'utilisateur et son préfixe
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members:
+                        user_groups.append(group_name)
+                        user_group_prefix = f"{group_name}_"
+                        break
+
+            products = CATALOG[category]
+            keyboard = []
+            display_name = category
+
+            # Détermine si c'est une catégorie publique
+            is_public_category = not any(category.startswith(f"{group}_") 
+                                       for group in admin_features._access_codes.get("groups", {}).keys())
+
+            for product in products:
+                if isinstance(product, dict):
+                    product_name = product['name']
+                    show_product = False
+
+                    if is_public_category:
+                        if user_groups:
+                            # Dans une catégorie publique avec un utilisateur de groupe
+                            # Montrer uniquement les produits de son groupe
+                            show_product = any(product_name.startswith(f"{group}_") for group in user_groups)
+                        else:
+                            # Utilisateur sans groupe : montrer uniquement les produits publics
+                            show_product = not any(product_name.startswith(f"{group}_") 
+                                                 for group in admin_features._access_codes.get("groups", {}).keys())
+                    else:
+                        # Dans une catégorie de groupe, montrer les produits si l'utilisateur est dans le bon groupe
+                        show_product = any(category.startswith(f"{group}_") and user_id in admin_features._access_codes["groups"][group]
+                                         for group in admin_features._access_codes.get("groups", {}).keys())
+
+                    if show_product:
+                        product_id = encode_for_callback(f"{category}_{product_name}")
+                        context.user_data[f'callback_{product_id}'] = {
+                            'category': category,
+                            'product_name': product_name,
+                            'group_prefix': user_group_prefix
+                        }
+
+                        # Afficher le nom sans le préfixe
+                        display_product_name = product_name
+                        for group in admin_features._access_codes.get("groups", {}).keys():
+                            prefix = f"{group}_"
+                            if display_product_name.startswith(prefix):
+                                display_product_name = display_product_name[len(prefix):]
+                                break
+
+                        keyboard.append([InlineKeyboardButton(
+                            display_product_name,
+                            callback_data=f"editp_{product_id}"
+                        )])
+
+            if not keyboard:
+                keyboard.append([InlineKeyboardButton("Aucun produit disponible", callback_data="noop")])
+
+            keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")])
+
+            await query.message.edit_text(
+                f"✏️ Sélectionnez le produit à modifier dans {display_name}:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return SELECTING_PRODUCT_TO_EDIT
+
+    elif query.data in ["edit_name", "edit_price", "edit_desc", "edit_media"]:
+        field_mapping = {
+            "edit_name": "name",
+            "edit_price": "price",
+            "edit_desc": "description",
+            "edit_media": "media"
+        }
+        field = field_mapping[query.data]
+        context.user_data['editing_field'] = field
+    
+        category = context.user_data.get('editing_category')
+        product_name = context.user_data.get('editing_product')
+    
+        # Récupérer le préfixe du groupe de l'utilisateur
+        user_id = query.from_user.id
+        user_group_prefix = ""
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_group_prefix = f"{group_name}_"
+                    break
+        
+        # Sauvegarder le préfixe dans le context pour l'utiliser lors de l'édition
+        context.user_data['group_prefix'] = user_group_prefix
+    
+        product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
+    
+        if product:
+            if field == 'media':
+                # Stocker les informations du produit en cours d'édition
+                context.user_data['temp_product_category'] = category
+                context.user_data['temp_product_name'] = product_name
+                context.user_data['temp_product_price'] = product.get('price')
+                context.user_data['temp_product_description'] = product.get('description')
+                context.user_data['temp_product_media'] = []
+                context.user_data['media_count'] = 0
+            
+                # Envoyer le message d'invitation pour les médias
+                message = await query.message.edit_text(
+                    "📸 Envoyez les photos ou vidéos du produit (plusieurs possibles)\n\n"
+                    "*Si vous ne voulez pas en envoyer, cliquez sur ignorer* \n\n"
+                    "*📌ATTENTION : Modifier les images écrase celles déjà existantes*",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")]
+                    ]),
+                    parse_mode='Markdown'
+                )
+                context.user_data['media_invitation_message_id'] = message.message_id
+                return WAITING_PRODUCT_MEDIA
+            else:
+                # Pour l'édition du nom, afficher la valeur sans le préfixe
+                current_value = product.get(field, "Non défini")
+                if field == 'name':
+                    # Enlever le préfixe pour l'affichage si présent
+                    for group in admin_features._access_codes.get("groups", {}).keys():
+                        prefix = f"{group}_"
+                        if current_value.startswith(prefix):
+                            current_value = current_value[len(prefix):]
+                            break
+
+                field_names = {
+                    'name': 'nom',
+                    'price': 'prix',
+                    'description': 'description'
+                }
+
+                # Message spécial pour l'édition du nom avec préfixe de groupe
+                if field == 'name' and user_group_prefix:
+                    bot_message = await query.message.edit_text(
+                        f"✏️ Modification du {field_names.get(field, field)}\n"
+                        f"Valeur actuelle : {current_value}\n\n"
+                        "Envoyez la nouvelle valeur :",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")
+                        ]])
+                    )
+                else:
+                    bot_message = await query.message.edit_text(
+                        f"✏️ Modification du {field_names.get(field, field)}\n"
+                        f"Valeur actuelle : {current_value}\n\n"
+                        "Envoyez la nouvelle valeur :",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")
+                        ]])
+                    )
+            
+                # Sauvegarder l'ID du message pour pouvoir le supprimer plus tard
+                context.user_data['last_bot_message'] = bot_message.message_id
+            
+                return WAITING_NEW_VALUE
+
+    elif query.data == "cancel_edit":
+        return await show_admin_menu(update, context)
+
+    elif query.data == "confirm_reset_stats":
+        # Réinitialiser les statistiques
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        CATALOG['stats'] = {
+            "total_views": 0,
+            "category_views": {},
+            "product_views": {},
+            "last_updated": now.split(" ")[1],  # Juste l'heure
+            "last_reset": now.split(" ")[0]  # Juste la date
+        }
+        save_catalog(CATALOG)
+        
+        # Afficher un message de confirmation
+        keyboard = [[InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")]]
+        await query.message.edit_text(
+            "✅ *Les statistiques ont été réinitialisées avec succès!*\n\n"
+            f"Date de réinitialisation : {CATALOG['stats']['last_reset']}\n\n"
+            "Toutes les statistiques sont maintenant à zéro.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+               
+    elif query.data == "show_categories":
+        keyboard = []
+        user_id = update.effective_user.id
+
+        # Vérifier les groupes de l'utilisateur
+        user_groups = []
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Fonction helper pour vérifier le SOLD OUT
+        def is_category_sold_out(cat_products):
+            return (len(cat_products) == 1 and 
+                    isinstance(cat_products[0], dict) and 
+                    cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+        # Créer les boutons de catégories
+        for category in CATALOG.keys():
+            if category != 'stats':
+                # Vérifier si c'est une catégorie de groupe
+                is_group_category = False
+                category_group = None
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if category.startswith(f"{group_name}_"):
+                        is_group_category = True
+                        category_group = group_name
+                        break
+
+                # Décider si l'utilisateur peut voir cette catégorie
+                show_category = False
+                if is_group_category:
+                    # Pour les catégories de groupe, l'utilisateur doit être membre du groupe
+                    if user_groups and category_group in user_groups:
+                        show_category = True
+                        display_name = category.replace(f"{category_group}_", "")
+                else:
+                    # Les catégories sans préfixe de groupe sont publiques
+                    show_category = True
+                    display_name = category
+
+                if show_category:
+                    is_sold_out = is_category_sold_out(CATALOG[category])
+                    display_text = f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}"
+                    keyboard.append([InlineKeyboardButton(display_text, callback_data=f"view_{category}")])
+
+        keyboard.append([InlineKeyboardButton("🔙 Retour à l'accueil", callback_data="back_to_home")])
+
+
+        try:
+            message = await query.edit_message_text(
+                "📋 *Menu*\n\n"
+                "Choisissez une catégorie pour voir les produits :",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            context.user_data['menu_message_id'] = message.message_id
+        except Exception as e:
+            print(f"Erreur lors de la mise à jour du message des catégories: {e}")
+            message = await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="📋 *Menu*\n\n"
+                     "Choisissez une catégorie pour voir les produits :",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            context.user_data['menu_message_id'] = message.message_id
+
+    elif query.data == "back_to_home":  # Ajout de cette condition ici
+            chat_id = update.effective_chat.id
+
+            # Définir le texte de bienvenue ici, avant les boutons
+            welcome_text = CONFIG.get('welcome_message', 
+                "🌿 <b>Bienvenue sur votre bot !</b> 🌿\n\n"
+                "<b>Pour changer ce message d accueil, rendez vous dans l onglet admin.</b>\n"
+                "📋 Cliquez sur MENU pour voir les catégories"
+            )
+
+            # Commencer avec le bouton MENU
+            keyboard = [
+                [InlineKeyboardButton("📋 MENU", callback_data="show_categories")]
+            ]
+
+            # Ajouter les boutons personnalisés
+            with open('config/config.json', 'r') as f:
+                config = json.load(f)
+
+            for button in config.get('custom_buttons', []):
+                if button['type'] == 'url':
+                    keyboard.append([InlineKeyboardButton(button['name'], url=button['value'])])
+                elif button['type'] == 'text':
+                    keyboard.append([InlineKeyboardButton(button['name'], callback_data=f"custom_text_{button['id']}")])
+
+            # Ajouter le bouton Réseaux avant le bouton Admin
+            #keyboard.append([InlineKeyboardButton("📱 Réseaux", callback_data="show_networks")])
+
+            # Ajouter le bouton admin en dernier si l'utilisateur est administrateur
+            if str(update.effective_user.id) in ADMIN_IDS:
+                keyboard.append([InlineKeyboardButton("🔧 Menu Admin", callback_data="admin")])
+
+            await query.message.edit_text(
+                text=welcome_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'  
+            )
+            return CHOOSING
+
+async def edit_product_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Gère l'édition du nom d'un produit"""
+        user_id = update.message.from_user.id
+        new_name = update.message.text.strip()
+        
+        if 'editing_category' not in context.user_data or 'editing_product' not in context.user_data:
+            await update.message.reply_text("❌ Erreur: Aucun produit en cours d'édition.")
+            return await self.show_admin_menu(update, context)
+
+        category = context.user_data['editing_category']
+        old_name = context.user_data['editing_product']
+        
+        try:
+            # Vérifier si le produit actuel a un préfixe de groupe
+            current_prefix = ""
+            for group in self._access_codes.get("groups", {}).keys():
+                if old_name.startswith(f"{group}_"):
+                    current_prefix = f"{group}_"
+                    break
+
+            # Récupérer le préfixe du groupe de l'utilisateur si nécessaire
+            user_group_prefix = ""
+            if "groups" in self._access_codes:
+                for group_name, members in self._access_codes["groups"].items():
+                    if user_id in members:
+                        user_group_prefix = f"{group_name}_"
+                        break
+
+            # Déterminer le préfixe à utiliser
+            prefix_to_use = current_prefix or user_group_prefix
+
+            # Si le produit avait un préfixe ou si l'utilisateur est dans un groupe,
+            # ajouter le préfixe approprié au nouveau nom
+            if prefix_to_use:
+                # Si le nouveau nom contient déjà le préfixe, ne pas le rajouter
+                if not new_name.startswith(prefix_to_use):
+                    new_name = f"{prefix_to_use}{new_name}"
+            
+            # Mettre à jour le nom du produit
+            product_found = False
+            for product in self.CATALOG[category]:
+                if isinstance(product, dict) and product['name'] == old_name:
+                    product['name'] = new_name
+                    product_found = True
+                    break
+
+            if not product_found:
+                raise Exception("Produit non trouvé")
+
+            # Sauvegarder les modifications
+            self.save_catalog(self.CATALOG)
+            
+            # Message de confirmation avec le nom sans préfixe
+            display_name = new_name
+            if prefix_to_use and new_name.startswith(prefix_to_use):
+                display_name = new_name[len(prefix_to_use):]
+                
+            await update.message.reply_text(f"✅ Nom du produit modifié avec succès en : {display_name}")
+            return await self.show_admin_menu(update, context)
+
+        except Exception as e:
+            print(f"Erreur lors de la modification du nom: {e}")
+            await update.message.reply_text("❌ Une erreur est survenue lors de la modification du nom.")
+            return await self.show_admin_menu(update, context)
+
+async def handle_new_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    old_category = context.user_data.get('category_to_edit')
+    user_id = update.effective_user.id
+    
+    # Obtenir le groupe de l'utilisateur
+    user_group = None
+    if "groups" in admin_features._access_codes:
+        for group_name, members in admin_features._access_codes["groups"].items():
+            if user_id in members and old_category.startswith(f"{group_name}_"):
+                user_group = group_name
+                break
+
+    # Si c'est une catégorie de groupe, conserver le préfixe du groupe
+    if user_group:
+        new_category = f"{user_group}_{new_name}"
+    else:
+        new_category = new_name
+
+    # Vérifier si le nouveau nom existe déjà
+    if new_category in CATALOG:
+        await update.message.reply_text(
+            "❌ Une catégorie avec ce nom existe déjà.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Retour", callback_data="edit_category")
+            ]])
+        )
+        return WAITING_NEW_CATEGORY_NAME
+
+    # Mettre à jour le catalogue
+    CATALOG[new_category] = CATALOG.pop(old_category)
+    save_catalog(CATALOG)
+
+    # Nettoyer les messages
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id - 1
+        )
+        await update.message.delete()
+    except Exception as e:
+        print(f"Erreur lors de la suppression des messages: {e}")
+
+    # Message de confirmation avec le nom affiché sans le préfixe du groupe
+    display_name = new_name  # On affiche le nom sans le préfixe
+    keyboard = [
+        [InlineKeyboardButton("✏️ Modifier une autre catégorie", callback_data="edit_category")],
+        [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+    ]
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"✅ Catégorie renommée en *{display_name}* avec succès!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    
+    return CHOOSING
+
+async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler temporaire pour obtenir le file_id de l'image banner"""
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id
+        CONFIG['banner_image'] = file_id
+        # Sauvegarder dans config.json
+        with open('config.json', 'w', encoding='utf-8') as f:
+            json.dump(CONFIG, f, indent=4)
+        await update.message.reply_text(
+            f"✅ Image banner enregistrée!\nFile ID: {file_id}"
+        )
+
+
+    # Récupérer le chat_id et le message
+    if update.callback_query:
+        chat_id = update.callback_query.message.chat_id
+    else:
+        chat_id = update.effective_chat.id
+
+    # Nouveau clavier simplifié pour l'accueil
+    keyboard = [
+        [InlineKeyboardButton("📋 MENU", callback_data="show_categories")]
+    ]
+
+    # Ajouter le bouton admin si l'utilisateur est administrateur
+    if str(update.effective_user.id) in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("🔧 Menu Admin", callback_data="admin")])
+
+    # Configurer le bouton de contact en fonction du type (URL ou username)
+    contact_button = None
+    if CONFIG.get('contact_url'):
+        contact_button = InlineKeyboardButton("📞 Contact", url=CONFIG['contact_url'])
+    elif CONFIG.get('contact_username'):
+        contact_button = InlineKeyboardButton("📞 Contact Telegram", url=f"https://t.me/{CONFIG['contact_username']}")
+
+    # Ajouter les boutons de contact et canaux
+    if contact_button:
+        keyboard.extend([
+            [
+                contact_button,
+                InlineKeyboardButton("💭 Canal telegram", url="https://t.me/+aHbA9_8tdTQwYThk")
+            ],
+            [
+                InlineKeyboardButton("🥔 Contact potato", url="https://dlj199.org/christianDry547"),
+                InlineKeyboardButton("📱 Instagram", url="https://www.instagram.com/christiandry.54?igsh=MWU1dXNrbXdpMzllNA%3D%3D&utm_source=qr")
+            ],
+            [
+                InlineKeyboardButton("🌐 Signal", url="https://signal.group/#CjQKIJNEETZNr9_LRMvShQbblk_NUdDyabA7e_eyUQY6-ptsEhBSpXex0cjIoOEYQ4H3D8K5"),
+                InlineKeyboardButton("👻 Snapchat", url="https://snapchat.com/t/0HumwTKi")
+            ]
+        ])
+    else:
+        keyboard.extend([
+            [
+                InlineKeyboardButton("💭 Canal telegram", url="https://t.me/+aHbA9_8tdTQwYThk"),
+                InlineKeyboardButton("🥔 Contact potato", url="https://dlj199.org/christianDry547")
+            ],
+            [
+                InlineKeyboardButton("📱 Instagram", url="https://www.instagram.com/christiandry.54?igsh=MWU1dXNrbXdpMzllNA%3D%3D&utm_source=qr"),
+                InlineKeyboardButton("🌐 Signal", url="https://signal.group/#CjQKIJNEETZNr9_LRMvShQbblk_NUdDyabA7e_eyUQY6-ptsEhBSpXex0cjIoOEYQ4H3D8K5")
+            ],
+            [
+                InlineKeyboardButton("👻 Snapchat", url="https://snapchat.com/t/0HumwTKi")
+            ]
+        ])
+
+    try:
+        if update.callback_query:
+            # Si c'est un callback, on édite le message existant
+            await update.callback_query.edit_message_text(
+                text=welcome_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+        else:
+            # Sinon, on envoie un nouveau message
+            menu_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=welcome_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+            context.user_data['menu_message_id'] = menu_message.message_id
+
+    except Exception as e:
+        print(f"Erreur lors du retour à l'accueil: {e}")
+        # En cas d'erreur, on essaie d'envoyer un nouveau message
+        try:
+            menu_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=welcome_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='HTML'
+            )
+            context.user_data['menu_message_id'] = menu_message.message_id
+        except Exception as e:
+            print(f"Erreur critique lors du retour à l'accueil: {e}")
+
+    return CHOOSING
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        if isinstance(context.error, NetworkError):
+            print(f"Erreur réseau: {context.error}")
+            if update and update.callback_query:
+                await update.callback_query.answer("Erreur de connexion, veuillez réessayer.")
+            await asyncio.sleep(1)  # Attendre avant de réessayer
+        elif isinstance(context.error, TimedOut):
+            print(f"Timeout: {context.error}")
+            if update and update.callback_query:
+                await update.callback_query.answer("La requête a pris trop de temps, veuillez réessayer.")
+            await asyncio.sleep(1)
+        else:
+            print(f"Une erreur s'est produite: {context.error}")
+    except Exception as e:
+        print(f"Erreur dans le gestionnaire d'erreurs: {e}")
+        
+def main():
+    """Fonction principale du bot"""
+    try:
+        # Créer l'application avec les timeouts personnalisés
+        global admin_features
         application = (
             Application.builder()
             .token(TOKEN)
-            .defaults(defaults)
+            .connect_timeout(30.0)
+            .read_timeout(30.0)
+            .write_timeout(30.0)
+            .get_updates_read_timeout(30.0)
+            .get_updates_write_timeout(30.0)
+            .get_updates_connect_timeout(30.0)
             .build()
         )
+        admin_features = AdminFeatures()
 
-        # Handler pour supprimer les commandes dans plusieurs topics
-        delete_handler = CommandDeleteHandler(
-            target_topic_ids=[2103, 6167]  # Liste de tous vos topic IDs
-        )
-        application.add_handler(delete_handler.get_handler(), group=1)
-        
-        # Vos handlers existants
-        application.add_handler(CommandHandler("classement", classement))
-        application.add_handler(CommandHandler("admin", admin_menu))
-        application.add_handler(CommandHandler('bank', cmd_bank))
-        application.add_handler(CommandHandler("start", cmd_start))
-        application.add_handler(CommandHandler("infos", infos))
-        application.add_handler(CommandHandler("rangs", rangs))
-        application.add_handler(CommandHandler("cmds", cmds))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CommandHandler("daily", daily))
-        application.add_handler(CommandHandler("bj", create_game))
-        application.add_handler(CommandHandler("setcredits", set_credits))
-        application.add_handler(CommandHandler("addcredits", add_credits))
-        application.add_handler(CommandHandler("reset_classement", reset_classement))
-        application.add_handler(CallbackQueryHandler(button_handler))
+        # Initialiser l'access manager
+        global access_manager
+        access_manager = AccessManager()
+
+        # Ajouter le gestionnaire d'erreurs
         application.add_error_handler(error_handler)
-        application.job_queue.run_repeating(check_game_timeouts, interval=5)  # Vérifie toutes les 5 secondes
-        application.job_queue.run_repeating(update_classement_job, interval=300)  # 300 secondes = 5 minutes
-   
-        print("🎲 Blackjack Bot démarré !")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-        
+
+        # Gestionnaire de conversation principal
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CommandHandler('start', start),
+                CommandHandler('admin', admin),
+                CallbackQueryHandler(handle_normal_buttons, pattern='^(show_categories|back_to_home|admin)$'),
+                CallbackQueryHandler(show_custom_buttons_menu, pattern="^show_custom_buttons$"),
+            ],
+            states={
+                CHOOSING: [
+                    CallbackQueryHandler(admin_features.remove_group_user, pattern="^remove_group_user$"),
+                    CallbackQueryHandler(admin_features.select_user_to_remove, pattern="^remove_from_group_"),
+                    CallbackQueryHandler(admin_features.remove_user, pattern="^remove_user_"),
+                    CallbackQueryHandler(admin_features.delete_group, pattern="^delete_group$"),
+                    CallbackQueryHandler(admin_features.confirm_delete_group, pattern="^confirm_delete_group_"),
+                    CallbackQueryHandler(admin_features.manage_groups, pattern="^manage_groups$"),
+                    CallbackQueryHandler(admin_features.list_groups, pattern="^list_groups$"),
+                    CallbackQueryHandler(admin_features.start_create_group, pattern="^create_group$"),
+                    CallbackQueryHandler(admin_features.handle_user_management, pattern="^user_page_[0-9]+$"),
+                    CallbackQueryHandler(list_buttons_for_editing, pattern="^list_buttons_edit$"),
+                    CallbackQueryHandler(handle_button_editing, pattern="^edit_button_[^_]+$"),
+                    CallbackQueryHandler(start_edit_button_name, pattern="^edit_button_name_"),
+                    CallbackQueryHandler(start_edit_button_value, pattern="^edit_button_value_"),
+                    CallbackQueryHandler(start_add_custom_button, pattern="^add_custom_button$"),
+                    CallbackQueryHandler(list_buttons_for_deletion, pattern="^list_buttons_delete$"),
+                    CallbackQueryHandler(handle_button_deletion, pattern="^delete_button_"),
+                    CallbackQueryHandler(admin_features.manage_broadcasts, pattern="^manage_broadcasts$"),
+                    CallbackQueryHandler(admin_features.edit_broadcast_content, pattern="^edit_broadcast_content_"),
+                    CallbackQueryHandler(admin_features.edit_broadcast, pattern="^edit_broadcast_"),
+                    CallbackQueryHandler(admin_features.resend_broadcast, pattern="^resend_broadcast_"),
+                    CallbackQueryHandler(admin_features.delete_broadcast, pattern="^delete_broadcast_"),
+                    CallbackQueryHandler(admin_features.handle_user_management, pattern="^manage_users$"),
+                    CallbackQueryHandler(admin_features.select_group_for_user, pattern="^select_group_"),
+                    CallbackQueryHandler(admin_features.show_add_user_to_group, pattern="^add_group_user$"),
+                    CallbackQueryHandler(admin_features.select_group_for_category, pattern="^select_group_for_category_"),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_CATEGORY_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category_name),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_PRODUCT_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_name),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_PRODUCT_PRICE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_price),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_PRODUCT_DESCRIPTION: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_product_description),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_PRODUCT_MEDIA: [
+                    MessageHandler(filters.PHOTO | filters.VIDEO, handle_product_media),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                SELECTING_CATEGORY: [
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_BUTTON_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_name),
+                    CallbackQueryHandler(handle_normal_buttons)
+                ],
+                WAITING_BUTTON_VALUE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_value),
+                    CallbackQueryHandler(handle_normal_buttons)
+                ],
+                SELECTING_CATEGORY_TO_DELETE: [
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                SELECTING_PRODUCT_TO_DELETE: [
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_CONTACT_USERNAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact_username),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                SELECTING_PRODUCT_TO_EDIT: [
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                EDITING_PRODUCT_FIELD: [
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_NEW_VALUE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_value),  # Sans le self
+                    CallbackQueryHandler(handle_normal_buttons)
+                ],
+                WAITING_BANNER_IMAGE: [
+                    MessageHandler(filters.PHOTO, handle_banner_image),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_WELCOME_MESSAGE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_welcome_message),
+                    CallbackQueryHandler(handle_normal_buttons)
+                ],
+                WAITING_ORDER_BUTTON_CONFIG: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_order_button_config),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_PRODUCT_MEDIA: [
+                    MessageHandler(filters.PHOTO | filters.VIDEO, handle_product_media),
+                    CallbackQueryHandler(finish_product_media, pattern="^finish_media$"),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_NEW_CATEGORY_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_category_name),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                EDITING_CATEGORY: [
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_FOR_ACCESS_CODE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_access_code),
+                    CallbackQueryHandler(start, pattern="^cancel_access$"),
+                ],
+                WAITING_GROUP_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_features.handle_group_name),
+                    CallbackQueryHandler(admin_features.manage_groups, pattern="^manage_groups$")
+                ],
+                WAITING_GROUP_USER: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_features.handle_group_user),
+                    CallbackQueryHandler(handle_normal_buttons),
+                ],
+                WAITING_BROADCAST_MESSAGE: [
+                    MessageHandler(
+                        (filters.TEXT | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND,
+                        admin_features.send_broadcast_message
+                    ),
+                    CallbackQueryHandler(handle_normal_buttons)
+                ],
+                WAITING_BROADCAST_EDIT: [
+                    MessageHandler(
+                        (filters.TEXT | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND,
+                        admin_features.handle_broadcast_edit
+                    ),
+                    CallbackQueryHandler(handle_normal_buttons)
+                ],
+            },
+            fallbacks=[
+                CommandHandler('start', start),
+                CommandHandler('admin', admin),
+            ],
+            name="main_conversation",
+            persistent=False,
+        )
+
+        application.add_handler(CommandHandler("ban", admin_features.handle_ban_command))
+        application.add_handler(CallbackQueryHandler(
+            admin_features.show_banned_users,
+            pattern="^show_banned$"
+        ))
+        application.add_handler(CallbackQueryHandler(
+            admin_features.handle_unban_callback,
+            pattern="^unban_"
+        ))
+        application.add_handler(CallbackQueryHandler(show_networks, pattern="^show_networks$"))
+        application.add_handler(CallbackQueryHandler(start, pattern="^start_cmd$"))
+        application.add_handler(CommandHandler("gencode", admin_generate_code))
+        application.add_handler(CommandHandler("listecodes", admin_list_codes))
+        application.add_handler(CommandHandler("group", admin_features.handle_group_command))
+        application.add_handler(conv_handler)
+
+        # Démarrer le bot avec les paramètres optimisés
+        print("Bot démarré...")
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
+            pool_timeout=30.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            connect_timeout=30.0
+        )
+
     except Exception as e:
-        logger.error(f"Erreur critique: {e}")
-        raise
-    finally:
-        db.conn.close()
+        print(f"Erreur lors du démarrage du bot: {e}")
 
 if __name__ == '__main__':
     main()
