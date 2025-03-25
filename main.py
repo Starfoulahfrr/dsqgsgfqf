@@ -1816,18 +1816,19 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     elif query.data.startswith("delete_product_category_"):
         category = query.data.replace("delete_product_category_", "")
         products = CATALOG.get(category, [])
-    
+
         keyboard = []
         for product in products:
             if isinstance(product, dict):
+                product_name = product['name'].replace(' ', '_')[:20]  # Remplacer les espaces par des underscores et limiter à 20 caractères
                 keyboard.append([
                     InlineKeyboardButton(
                         product['name'],
-                        callback_data=f"confirm_delete_product_{category[:10]}_{product['name'][:20]}"
+                        callback_data=f"confirm_delete_product_{category[:10]}_{product_name}"
                     )
                 ])
         keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_delete_product")])
-    
+
         await query.message.edit_text(
             f"⚠️ Sélectionnez le produit à supprimer de *{category}* :",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1849,11 +1850,11 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         return SELECTING_CATEGORY_TO_DELETE
 
     elif query.data.startswith("confirm_delete_category_"):
-        # Ajoutez une étape de confirmation
         category = query.data.replace("confirm_delete_category_", "")
+        safe_category = category.replace(' ', '_')  # Remplacer les espaces par des underscores
         keyboard = [
             [
-                InlineKeyboardButton("✅ Oui, supprimer", callback_data=f"really_delete_category_{category}"),
+                InlineKeyboardButton("✅ Oui, supprimer", callback_data=f"really_delete_category_{safe_category}"),
                 InlineKeyboardButton("❌ Non, annuler", callback_data="cancel_delete_category")
             ]
         ]
@@ -1875,9 +1876,7 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.edit_text(
                 f"✅ La catégorie *{category}* a été supprimée avec succès !",
                 parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")
-                ]])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")]])
             )
         return CHOOSING
 
@@ -1900,38 +1899,37 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         return SELECTING_CATEGORY_TO_DELETE
 
     elif query.data.startswith("confirm_delete_product_"):
-            try:
-                # Extraire la catégorie et le nom du produit
-                parts = query.data.replace("confirm_delete_product_", "").split("_")
-                short_category = parts[0]
-                short_product = "_".join(parts[1:])  # Pour gérer les noms avec des underscores
-                
-                # Trouver la vraie catégorie et le vrai produit
-                category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
-                if category:
-                    product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
-                    if product_name:
-                        # Créer le clavier de confirmation avec les noms courts
-                        keyboard = [
-                            [
-                                InlineKeyboardButton("✅ Oui, supprimer", 
-                                    callback_data=f"really_delete_product_{category[:10]}_{product_name[:20]}"),
-                                InlineKeyboardButton("❌ Non, annuler", 
-                                    callback_data="cancel_delete_product")
-                            ]
-                        ]
-                    
-                        await query.message.edit_text(
-                            f"⚠️ *Êtes-vous sûr de vouloir supprimer le produit* `{product_name}` *?*\n\n"
-                            f"Cette action est irréversible !",
-                            reply_markup=InlineKeyboardMarkup(keyboard),
-                            parse_mode='Markdown'
-                        )
-                        return SELECTING_PRODUCT_TO_DELETE
+        try:
+            # Extraire la catégorie et le nom du produit
+            parts = query.data.replace("confirm_delete_product_", "").split("_")
+            short_category = parts[0]
+            short_product = "_".join(parts[1:])  # Pour gérer les noms avec des underscores
 
-            except Exception as e:
-                print(f"Erreur lors de la confirmation de suppression: {e}")
-                return await show_admin_menu(update, context)
+            # Trouver la vraie catégorie et le vrai produit
+            category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
+            if category:
+                product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
+                if product_name:
+                    # Créer le clavier de confirmation avec les noms courts
+                    keyboard = [
+                        [
+                            InlineKeyboardButton("✅ Oui, supprimer", 
+                                callback_data=f"really_delete_product_{category[:10]}_{product_name[:20]}"),
+                            InlineKeyboardButton("❌ Non, annuler", 
+                                callback_data="cancel_delete_product")
+                        ]
+                    ]
+                
+                    await query.message.edit_text(
+                        f"⚠️ *Êtes-vous sûr de vouloir supprimer le produit* `{product_name}` *?*\n\n"
+                        f"Cette action est irréversible !",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode='Markdown'
+                    )
+                    return SELECTING_PRODUCT_TO_DELETE
+        except Exception as e:
+            print(f"Erreur lors de la confirmation de suppression: {e}")
+            return await show_admin_menu(update, context)
 
     elif query.data.startswith("really_delete_product_"):
         try:
