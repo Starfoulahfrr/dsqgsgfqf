@@ -1,6 +1,7 @@
 from handlers.admin_features import AdminFeatures
 from modules.access_manager import AccessManager
 import json
+import base64
 import logging
 import asyncio
 import shutil
@@ -24,7 +25,7 @@ paris_tz = pytz.timezone('Europe/Paris')
 STATS_CACHE = None
 LAST_CACHE_UPDATE = None
 admin_features = None
-
+CATALOG_FILE = 'config/catalog.json'
 # Désactiver les logs de httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -54,15 +55,48 @@ except KeyError as e:
 
 # Fonctions de gestion du catalogue
 def load_catalog():
+    """Charge le catalogue depuis le fichier JSON"""
     try:
-        with open(CONFIG['catalog_file'], 'r', encoding='utf-8') as f:
-            return json.load(f)
+        with open(CATALOG_FILE, 'r', encoding='utf-8') as f:
+            catalog = json.load(f)
+            return catalog
     except FileNotFoundError:
+        print(f"Fichier catalogue non trouvé dans {CATALOG_FILE}, création d'un nouveau catalogue")
+        return {'stats': {'total_views': 0, 'category_views': {}, 'product_views': {}, 
+                'last_updated': datetime.now().strftime('%H:%M:%S'),
+                'last_reset': datetime.now().strftime('%Y-%m-%d')}}
+    except Exception as e:
+        print(f"Erreur lors du chargement du catalogue: {e}")
         return {}
 
 def save_catalog(catalog):
-    with open(CONFIG['catalog_file'], 'w', encoding='utf-8') as f:
-        json.dump(catalog, f, indent=4, ensure_ascii=False)
+    """Sauvegarde le catalogue dans le fichier JSON"""
+    try:
+        # Assurer que le dossier config existe
+        os.makedirs(os.path.dirname(CATALOG_FILE), exist_ok=True)
+        
+        with open(CATALOG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(catalog, f, indent=4, ensure_ascii=False)
+        
+    except Exception as e:
+        print(f"Erreur lors de la sauvegarde du catalogue : {e}")
+
+def encode_for_callback(text):
+    """Encode le texte pour le callback_data de manière sécurisée"""
+    try:
+        # Limiter la longueur du callback_data en utilisant un hash court
+        safe_id = str(abs(hash(text)) % 10000)
+        return safe_id
+    except Exception as e:
+        return str(abs(hash(str(text))) % 10000)
+
+def decode_from_callback(safe_id, context):
+    """Décode le texte du callback_data"""
+    try:
+        # Récupérer la valeur originale depuis le context
+        return context.user_data.get(f'callback_{safe_id}')
+    except Exception as e:
+        return None
 
 def clean_stats():
     """Nettoie les statistiques des produits et catégories qui n'existent plus"""
@@ -144,6 +178,14 @@ def backup_data():
     if os.path.exists("config/catalog.json"):
         shutil.copy2("config/catalog.json", f"{backup_dir}/catalog_{timestamp}.json")
 
+def is_category_sold_out(catalog, category):
+    """Vérifie si une catégorie est en SOLD OUT"""
+    if category not in catalog:
+        return False
+    return (len(catalog[category]) == 1 and 
+            isinstance(catalog[category][0], dict) and 
+            catalog[category][0].get('name') == 'SOLD OUT ! ❌')
+
 def print_catalog_debug():
     """Fonction de debug pour afficher le contenu du catalogue"""
     for category, products in CATALOG.items():
@@ -153,16 +195,6 @@ def print_catalog_debug():
                 print(f"  Produit: {product['name']}")
                 if 'media' in product:
                     print(f"    Médias ({len(product['media'])}): {product['media']}")
-
-# Normalisation des données de callback
-def normalize_callback_data(data, max_length=64):
-    data = data.replace(' ', '_')
-    data = re.sub(r'\W+', '', data)
-    return data[:max_length]
-
-# Vérification des noms
-def is_valid_name(name):
-    return re.match(r'^[a-zA-Z0-9_\- ]+$', name) is not None
 
 # États de conversation
 WAITING_FOR_ACCESS_CODE = "WAITING_FOR_ACCESS_CODE"
@@ -188,6 +220,8 @@ WAITING_NEW_CATEGORY_NAME = "WAITING_NEW_CATEGORY_NAME"
 WAITING_BUTTON_NAME = "WAITING_BUTTON_NAME"
 WAITING_BUTTON_VALUE = "WAITING_BUTTON_VALUE"
 WAITING_BROADCAST_EDIT = "WAITING_BROADCAST_EDIT"
+WAITING_GROUP_NAME = "WAITING_GROUP_NAME"
+WAITING_GROUP_USER = "WAITING_GROUP_USER"
 
 # Charger le catalogue au démarrage
 CATALOG = load_catalog()
@@ -294,7 +328,7 @@ async def admin_list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f"Expire le: {exp_str}\n\n"
 
     await update.message.reply_text(message, parse_mode='Markdown')
-
+    
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -308,7 +342,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Enregistrer utilisateur
     await admin_features.register_user(user)
-    
+
+    if admin_features.is_user_banned(user.id):
+        # Supprimer tous les messages précédents du bot
+        try:
+            # Supprimer les messages stockés dans le context
+            messages_to_delete = [
+                'menu_message_id',
+                'banner_message_id',
+                'category_message_id',
+                'last_product_message_id',
+                'initial_welcome_message_id'
+            ]
+            
+            for message_key in messages_to_delete:
+                if message_key in context.user_data:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=chat_id,
+                            message_id=context.user_data[message_key]
+                        )
+                        del context.user_data[message_key]
+                    except Exception:
+                        pass
+            
+            # Vider les données utilisateur
+            context.user_data.clear()
+        except Exception as e:
+            print(f"Erreur lors de la suppression des messages: {e}")
+        
+        return ConversationHandler.END
     # Vérifier si l'utilisateur est autorisé
     if not access_manager.is_authorized(user.id):
         # Supprimer l'ancien message de bienvenue s'il existe
@@ -324,8 +387,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Envoyer le nouveau message de bienvenue
         welcome_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text="🔒 Bienvenue ! Pour accéder au bot, veuillez entrer votre code d'accès."
+            text="🔒 Bienvenue ! Pour accéder au bot, veuillez entrer votre code d'accès.\n\n"
+                 "Si vous n'avez pas de code d'accès vous pouvez en demander un en écrivant à @ASwissPlug"
         )
+
         # Sauvegarder l'ID du message de bienvenue
         context.user_data['initial_welcome_message_id'] = welcome_msg.message_id
         return WAITING_FOR_ACCESS_CODE
@@ -351,7 +416,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     
-    # Nouveau clavier simplifié pour l'accueil
+    # Menu standard pour tous les utilisateurs
     keyboard = [
         [InlineKeyboardButton("📋 MENU", callback_data="show_categories")]
     ]
@@ -365,6 +430,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(button['name'], url=button['value'])])
         elif button['type'] == 'text':
             keyboard.append([InlineKeyboardButton(button['name'], callback_data=f"custom_text_{button['id']}")])
+
     # Définir le texte de bienvenue ici, avant les boutons
     welcome_text = CONFIG.get('welcome_message', 
         "🌿 <b>Bienvenue sur votre bot !</b> 🌿\n\n"
@@ -373,10 +439,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     # Ajouter les boutons de contact et réseaux en colonne
-    keyboard.extend([
-        [InlineKeyboardButton("📱 Réseaux", callback_data="show_networks")]
 
-    ])
 
     # Ajouter le bouton admin si l'utilisateur est administrateur
     if str(update.effective_user.id) in ADMIN_IDS:
@@ -412,7 +475,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['menu_message_id'] = menu_message.message_id
     
     return CHOOSING
-
+    
 async def show_networks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche tous les réseaux sociaux"""
     query = update.callback_query
@@ -420,11 +483,19 @@ async def show_networks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [
-            InlineKeyboardButton("💭 Canal telegram", url="https://t.me/+wS7RBp6QV78xNjhk")
+            InlineKeyboardButton("💭 Tchat telegram", url="https://t.me/+dzjwvg5XKqNkZWE0")
         ],
 
         [
-            InlineKeyboardButton("🥔 Canal potato", url="https://doudlj.org/joinchat/5ZEmn25bOsTR7f-aYdvC0Q")
+            InlineKeyboardButton("🥔 Canal potato", url="https://doudlj.org/joinchat/QwqUM5gH7Q8VqO3SnS4YwA")
+        ],
+
+        [
+            InlineKeyboardButton("🔒 Session", callback_data="show_info_potato")
+        ],
+
+        [
+            InlineKeyboardButton("👻 Snapchat", url="https://www.snapchat.com/add/lapharmacie6933?share_id=TCLVcQ_TWlk&locale=fr-FR")
         ],
         [InlineKeyboardButton("🔙 Retour", callback_data="back_to_home")]
     ]
@@ -486,6 +557,7 @@ async def show_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✏️ Modifier une catégorie", callback_data="edit_category")],
         [InlineKeyboardButton("✏️ Modifier un produit", callback_data="edit_product")],
         [InlineKeyboardButton("🎯 Gérer boutons accueil", callback_data="show_custom_buttons")],
+        [InlineKeyboardButton("👥 Gérer les groupes", callback_data="manage_groups")],
         [InlineKeyboardButton(f"🔒 Code d'accès: {status_text}", callback_data="toggle_access_code")],
         [InlineKeyboardButton("📊 Statistiques", callback_data="show_stats")],
         [InlineKeyboardButton("🛒 Modifier bouton Commander", callback_data="edit_order_button")],
@@ -813,128 +885,6 @@ async def start_edit_button_name(update: Update, context: ContextTypes.DEFAULT_T
     
     return WAITING_BUTTON_NAME
 
-async def handle_delete_category(query):
-    keyboard = []
-    for category in CATALOG.keys():
-        if category != 'stats':
-            keyboard.append([InlineKeyboardButton(category, callback_data=f"confirm_delete_category_{normalize_callback_data(category)}")])
-    keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_delete_category")])
-    
-    await query.message.edit_text(
-        "⚠️ Sélectionnez la catégorie à supprimer:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return SELECTING_CATEGORY_TO_DELETE
-
-async def confirm_delete_category(query):
-    category = query.data.replace("confirm_delete_category_", "")
-    if not is_valid_name(category):
-        await query.answer("Nom de catégorie invalide.")
-        return
-
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Oui, supprimer", callback_data=f"really_delete_category_{normalize_callback_data(category)}"),
-            InlineKeyboardButton("❌ Non, annuler", callback_data="cancel_delete_category")
-        ]
-    ]
-    await query.message.edit_text(
-        f"⚠️ *Êtes-vous sûr de vouloir supprimer la catégorie* `{category}` *?*\n\n"
-        f"Cette action supprimera également tous les produits de cette catégorie.\n"
-        f"Cette action est irréversible !",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-    return SELECTING_CATEGORY_TO_DELETE
-
-async def really_delete_category(query):
-    category = query.data.replace("really_delete_category_", "")
-    if category in CATALOG:
-        del CATALOG[category]
-        save_catalog(CATALOG)
-        await query.message.edit_text(
-            f"✅ La catégorie *{category}* a été supprimée avec succès !",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")
-            ]])
-        )
-    return CHOOSING
-
-async def handle_delete_product(query):
-    keyboard = []
-    for category in CATALOG.keys():
-        if category != 'stats':
-            keyboard.append([
-                InlineKeyboardButton(
-                    category, 
-                    callback_data=f"delete_product_category_{normalize_callback_data(category)}"
-                )
-            ])
-    keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_delete_product")])
-    
-    await query.message.edit_text(
-        "⚠️ Sélectionnez la catégorie du produit à supprimer:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return SELECTING_CATEGORY_TO_DELETE
-
-async def confirm_delete_product(query):
-    try:
-        parts = query.data.replace("confirm_delete_product_", "").split("_")
-        short_category = parts[0]
-        short_product = "_".join(parts[1:])
-        
-        category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
-        if category:
-            product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
-            if product_name and is_valid_name(product_name):
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Oui, supprimer", 
-                            callback_data=f"really_delete_product_{normalize_callback_data(category[:10])}_{normalize_callback_data(product_name[:20])}"),
-                        InlineKeyboardButton("❌ Non, annuler", 
-                            callback_data="cancel_delete_product")
-                    ]
-                ]
-                
-                await query.message.edit_text(
-                    f"⚠️ *Êtes-vous sûr de vouloir supprimer le produit* `{product_name}` *?*\n\n"
-                    f"Cette action est irréversible !",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode='Markdown'
-                )
-                return SELECTING_PRODUCT_TO_DELETE
-
-    except Exception as e:
-        print(f"Erreur lors de la confirmation de suppression: {e}")
-        return await show_admin_menu(update, context)
-
-async def really_delete_product(query):
-    try:
-        parts = query.data.replace("really_delete_product_", "").split("_")
-        short_category = parts[0]
-        short_product = "_".join(parts[1:])
-
-        category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
-        if category:
-            product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
-            if product_name:
-                CATALOG[category] = [p for p in CATALOG[category] if p['name'] != product_name]
-                save_catalog(CATALOG)
-                await query.message.edit_text(
-                    f"✅ Le produit *{product_name}* a été supprimé avec succès !",
-                    parse_mode='Markdown',
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")
-                    ]])
-                )
-        return CHOOSING
-
-    except Exception as e:
-        print(f"Erreur lors de la suppression du produit: {e}")
-        return await show_admin_menu(update, context)
-
 async def start_edit_button_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Commence l'édition de la valeur d'un bouton"""
     query = update.callback_query
@@ -1224,71 +1174,105 @@ async def handle_banner_image(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère l'ajout d'une nouvelle catégorie"""
     category_name = update.message.text.strip()
+    user_id = update.effective_user.id
     
-    # Fonction pour compter les emojis
-    def count_emojis(text):
-        emoji_pattern = re.compile("["
-            u"\U0001F600-\U0001F64F"  # emoticons
-            u"\U0001F300-\U0001F5FF"  # symbols & pictographs
-            u"\U0001F680-\U0001F6FF"  # transport & map symbols
-            u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
-            u"\U00002702-\U000027B0"
-            u"\U000024C2-\U0001F251"
-            "]+", flags=re.UNICODE)
-        return len(emoji_pattern.findall(text))
+    # Vérifier les groupes de l'utilisateur
+    user_groups = []
+    selected_group = None
     
-    # Limites
-    MAX_LENGTH = 32  # Longueur maximale du nom de catégorie
-    MAX_EMOJIS = 3   # Nombre maximum d'emojis
-    MAX_WORDS = 5    # Nombre maximum de mots
-    
-    # Vérifications
-    word_count = len(category_name.split())
-    emoji_count = count_emojis(category_name)
-    
-    error_message = None
-    if len(category_name) > MAX_LENGTH:
-        error_message = f"❌ Le nom de la catégorie ne doit pas dépasser {MAX_LENGTH} caractères."
-    elif word_count > MAX_WORDS:
-        error_message = f"❌ Le nom de la catégorie ne doit pas dépasser {MAX_WORDS} mots."
-    elif emoji_count > MAX_EMOJIS:
-        error_message = f"❌ Le nom de la catégorie ne doit pas contenir plus de {MAX_EMOJIS} emojis."
-    elif category_name in CATALOG:
-        error_message = "❌ Cette catégorie existe déjà."
-    
-    if error_message:
+    # Récupérer tous les groupes de l'utilisateur
+    if "groups" in admin_features._access_codes:
+        for group_name, members in admin_features._access_codes["groups"].items():
+            if user_id in members:
+                user_groups.append(group_name)
+
+    # Si l'utilisateur est dans plusieurs groupes, lui demander de choisir
+    if len(user_groups) > 1:
+        keyboard = []
+        for group_name in user_groups:
+            keyboard.append([InlineKeyboardButton(
+                group_name,
+                callback_data=f"select_group_for_category_{group_name}_{category_name}"
+            )])
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="admin")])
+
         await update.message.reply_text(
-            error_message + "\nVeuillez choisir un autre nom:",
+            "📝 Dans quel groupe voulez-vous créer cette catégorie ?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING
+    elif len(user_groups) == 1:
+        # Si l'utilisateur n'est que dans un seul groupe
+        selected_group = user_groups[0]
+        category_name = f"{selected_group}_{category_name}"
+
+    # Vérifier si la catégorie existe déjà
+    if category_name in CATALOG:
+        await update.message.reply_text(
+            "❌ Cette catégorie existe déjà.\n"
+            "Veuillez choisir un autre nom :",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_category")
+                InlineKeyboardButton("🔙 Annuler", callback_data="admin")
             ]])
         )
         return WAITING_CATEGORY_NAME
-    
+
+    # Ajouter la nouvelle catégorie
     CATALOG[category_name] = []
     save_catalog(CATALOG)
+
+    # Supprimer les messages
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id - 1
+        )
+        await update.message.delete()
+    except Exception as e:
+        print(f"Erreur lors de la suppression des messages: {e}")
+
+    # Message de confirmation
+    display_name = category_name.split("_", 1)[1] if "_" in category_name else category_name
+    keyboard = [
+        [InlineKeyboardButton("➕ Ajouter une autre catégorie", callback_data="add_category")],
+        [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+    ]
     
-    # Supprimer le message précédent
-    await context.bot.delete_message(
+    message_text = (f"✅ Catégorie *{display_name}* créée avec succès"
+                   f"{f' dans le groupe *{selected_group}*' if selected_group else ''}!")
+    
+    await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        message_id=update.message.message_id - 1
+        text=message_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
     )
     
-    # Supprimer le message de l'utilisateur
-    await update.message.delete()
-    
-    return await show_admin_menu(update, context)
+    return CHOOSING
 
 async def handle_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère l'entrée du nom du produit"""
     product_name = update.message.text
     category = context.user_data.get('temp_product_category')
+    user_id = update.effective_user.id
     
-    # Vérifier si la catégorie contient SOLD OUT et le supprimer
-    if category and CATALOG.get(category):
-        if len(CATALOG[category]) == 1 and CATALOG[category][0].get('name') == 'SOLD OUT ! ❌':
-            CATALOG[category] = []
-            save_catalog(CATALOG)
+    # Vérifier si l'utilisateur est membre d'un groupe
+    user_groups = []
+    if "groups" in admin_features._access_codes:
+        for group_name, members in admin_features._access_codes["groups"].items():
+            if user_id in members:
+                user_groups.append(group_name)
+
+    # Si c'est une catégorie publique et que l'utilisateur est dans un groupe
+    if not any(category.startswith(f"{g}_") for g in admin_features._access_codes.get("groups", {}).keys()):
+        if user_groups:
+            # Ajouter le préfixe du premier groupe de l'utilisateur au nom du produit
+            product_name = f"{user_groups[0]}_{product_name}"
+
+    # Vérifier si la catégorie existe et contient SOLD OUT
+    if category in CATALOG and len(CATALOG[category]) == 1 and CATALOG[category][0].get('name') == 'SOLD OUT ! ❌':
+        CATALOG[category] = []  # Nettoyer la catégorie SOLD OUT
+        save_catalog(CATALOG)
 
     if category and any(p.get('name') == product_name for p in CATALOG.get(category, [])):
         await update.message.reply_text(
@@ -1301,7 +1285,7 @@ async def handle_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     context.user_data['temp_product_name'] = product_name
     
-    # Supprimer le message précédent
+    # Le reste de votre code reste identique
     await context.bot.delete_message(
         chat_id=update.effective_chat.id,
         message_id=update.message.message_id - 1
@@ -1314,7 +1298,6 @@ async def handle_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]])
     )
     
-    # Supprimer le message de l'utilisateur
     await update.message.delete()
     
     return WAITING_PRODUCT_PRICE
@@ -1440,18 +1423,21 @@ async def finish_product_media(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     category = context.user_data.get('temp_product_category')
+    
     if not category:
         return await show_admin_menu(update, context)
 
-    if context.user_data.get('editing_category'):  # Si on est en mode édition
+    # Pour l'édition d'un produit existant
+    if context.user_data.get('editing_category'):
         product_name = context.user_data.get('editing_product')
-        if product_name:
+        if product_name and category in CATALOG:
             for product in CATALOG[category]:
                 if product['name'] == product_name:
                     product['media'] = context.user_data.get('temp_product_media', [])
                     save_catalog(CATALOG)
                     break
-    else:  # Si on est en mode création
+    else:
+        # Pour un nouveau produit
         new_product = {
             'name': context.user_data.get('temp_product_name'),
             'price': context.user_data.get('temp_product_price'),
@@ -1459,22 +1445,37 @@ async def finish_product_media(update: Update, context: ContextTypes.DEFAULT_TYP
             'media': context.user_data.get('temp_product_media', [])
         }
 
+        # Vérifier si la catégorie est en SOLD OUT et la nettoyer si nécessaire
+        if category in CATALOG and len(CATALOG[category]) == 1 and CATALOG[category][0].get('name') == 'SOLD OUT ! ❌':
+            CATALOG[category] = []  # Nettoyer la catégorie SOLD OUT
+
+        # S'assurer que la catégorie existe dans CATALOG
         if category not in CATALOG:
             CATALOG[category] = []
+            
+        # Ajouter le nouveau produit
         CATALOG[category].append(new_product)
         save_catalog(CATALOG)
 
-    # Nettoyer et retourner au menu admin
+    # Nettoyer les données temporaires
     context.user_data.clear()
+
+    # Reste du code (keyboard, etc.)
     keyboard = [
         [InlineKeyboardButton("➕ Ajouter une catégorie", callback_data="add_category")],
         [InlineKeyboardButton("➕ Ajouter un produit", callback_data="add_product")],
         [InlineKeyboardButton("❌ Supprimer une catégorie", callback_data="delete_category")],
         [InlineKeyboardButton("❌ Supprimer un produit", callback_data="delete_product")],
+        [InlineKeyboardButton("✏️ Modifier une catégorie", callback_data="edit_category")],
         [InlineKeyboardButton("✏️ Modifier un produit", callback_data="edit_product")],
+        [InlineKeyboardButton("🎯 Gérer boutons accueil", callback_data="show_custom_buttons")],
+        [InlineKeyboardButton("👥 Gérer les groupes", callback_data="manage_groups")],
+        [InlineKeyboardButton(f"🔒 Code d'accès: {status_text}", callback_data="toggle_access_code")],
         [InlineKeyboardButton("📊 Statistiques", callback_data="show_stats")],
-        [InlineKeyboardButton("📞 Modifier le contact", callback_data="edit_contact")],
+        [InlineKeyboardButton("🛒 Modifier bouton Commander", callback_data="edit_order_button")],
+        [InlineKeyboardButton("🏠 Modifier message d'accueil", callback_data="edit_welcome")],  
         [InlineKeyboardButton("🖼️ Modifier image bannière", callback_data="edit_banner_image")],
+        [InlineKeyboardButton("📢 Gestion annonces", callback_data="manage_broadcasts")],
         [InlineKeyboardButton("🔙 Retour à l'accueil", callback_data="back_to_home")]
     ]
 
@@ -1495,43 +1496,113 @@ async def finish_product_media(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['menu_message_id'] = message.message_id
     return CHOOSING
 
-async def handle_new_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la nouvelle valeur pour le champ en cours de modification"""
-    category = context.user_data.get('editing_category')
-    product_name = context.user_data.get('editing_product')
-    field = context.user_data.get('editing_field')
+async def handle_new_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Déclarer current_catalog en dehors du try
+    current_catalog = None
     
-    # Utiliser text_html pour capturer le formatage
-    new_value = update.message.text_html if hasattr(update.message, 'text_html') else update.message.text
+    try:
+        # Supprimer le message d'invite précédent
+        if 'last_bot_message' in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=context.user_data['last_bot_message']
+                )
+            except Exception as e:
+                print(f"Erreur lors de la suppression du message précédent: {e}")
 
-    if not all([category, product_name, field]):
-        await update.message.reply_text("❌ Une erreur est survenue. Veuillez réessayer.")
+        # Supprimer le message de l'utilisateur
+        try:
+            await update.message.delete()
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message utilisateur: {e}")
+
+        field = context.user_data.get('editing_field')
+        category = context.user_data.get('editing_category')
+        old_product_name = context.user_data.get('editing_product')
+        new_value = update.message.text.strip()
+
+        # Vérifier que toutes les données nécessaires sont présentes
+        if not all([field, category, old_product_name]):
+            raise Exception("Données manquantes pour la modification")
+
+        # Si on modifie le nom, gérer le préfixe
+        if field == 'name':
+            current_prefix = ""
+            for group in admin_features._access_codes.get("groups", {}).keys():
+                if old_product_name.startswith(f"{group}_"):
+                    current_prefix = f"{group}_"
+                    break
+            
+            if current_prefix:
+                new_value = f"{current_prefix}{new_value}"
+
+        # Charger le catalogue actuel
+        current_catalog = load_catalog()  # Déplacé ici après la vérification des données
+
+        # Faire une copie des stats avant modification
+        stats = current_catalog.get('stats', {}).copy()  # Utiliser .copy() pour une copie profonde
+
+        # Trouver et modifier le produit
+        product_found = False
+        if category in current_catalog:
+            for i, product in enumerate(current_catalog[category]):
+                if isinstance(product, dict) and product.get('name') == old_product_name:
+                    # Créer une copie du produit et modifier la valeur
+                    updated_product = product.copy()
+                    updated_product[field] = new_value
+                    current_catalog[category][i] = updated_product
+                    product_found = True
+                    print(f"Produit trouvé et modifié: {json.dumps(updated_product, indent=2, ensure_ascii=False)}")
+                    break
+
+            if not product_found:
+                raise Exception(f"Produit '{old_product_name}' non trouvé dans la catégorie '{category}'")
+        else:
+            raise Exception(f"Catégorie '{category}' non trouvée dans le catalogue")
+
+        # Restaurer les stats
+        if 'stats' in current_catalog:
+            current_catalog['stats'] = stats
+
+        # Sauvegarder le catalogue
+        save_catalog(current_catalog)
+
+        # Mettre à jour les deux références au catalogue
+        global CATALOG
+        CATALOG = current_catalog
+        admin_features.CATALOG = current_catalog
+
+        # Message de confirmation
+        success_message = await update.message.reply_text(
+            f"✅ {field.capitalize()} modifié avec succès !"
+        )
+        
+        # Auto-destruction du message après 3 secondes
+        await asyncio.sleep(3)
+        try:
+            await success_message.delete()
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message de confirmation: {e}")
+
+        # Retourner au menu admin
         return await show_admin_menu(update, context)
 
-    for product in CATALOG.get(category, []):
-        if product['name'] == product_name:
-            old_value = product.get(field, "Non défini")
-            product[field] = new_value
-            save_catalog(CATALOG)
-
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=update.message.message_id - 1
-            )
-            await update.message.delete()
-
-            keyboard = [[InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")]]
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"✅ Modification effectuée avec succès !\n\n"
-                     f"Ancien {field}: {old_value}\n"
-                     f"Nouveau {field}: {new_value}",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='HTML'  # Ajout du parse_mode HTML
-            )
-            break
-
-    return CHOOSING
+    except Exception as e:
+        print(f"Erreur détaillée lors de la modification: {str(e)}")
+        error_message = await update.message.reply_text(
+            "❌ Une erreur est survenue lors de la modification.\n"
+            f"Détails: {str(e)}"
+        )
+        
+        # Auto-destruction du message d'erreur après 3 secondes
+        await asyncio.sleep(3)
+        try:
+            await error_message.delete()
+        except Exception as e:
+            print(f"Erreur lors de la suppression du message d'erreur: {e}")
+            
+        return await show_admin_menu(update, context)
 
 async def handle_contact_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère la modification du contact"""
@@ -1673,8 +1744,8 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif query.data == "show_info_potato":
         text = (
-            "🔒 <b>Ceci est un exemple de bouton avec texte</b>\n\n"
-            "<code>Possible de mettre un id SESSION par exemple.</code>"
+            "🔒 <b>Voici notre ID Session pour passer commande :</b>\n\n"
+            "<code>051dafdaccdb8635e039f09f2206ab3be9a05d0bb5ec55d60a699192b5a5b4854e</code>"
         )
         keyboard = [[InlineKeyboardButton("🔙 Retour aux réseaux", callback_data="show_networks")]]
         
@@ -1909,11 +1980,59 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif query.data == "add_product":
         keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Fonction helper pour vérifier le SOLD OUT
+        def is_category_sold_out(cat_products):
+            return (len(cat_products) == 1 and 
+                    isinstance(cat_products[0], dict) and 
+                    cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Filtrer les catégories selon les groupes de l'utilisateur
         for category in CATALOG.keys():
             if category != 'stats':
-                keyboard.append([InlineKeyboardButton(category, callback_data=f"select_category_{category}")])
+                if user_groups:
+                    # Pour les utilisateurs dans des groupes
+                    # 1. Montrer les catégories de leurs groupes
+                    for group_name in user_groups:
+                        if category.startswith(f"{group_name}_"):
+                            display_name = category.replace(f"{group_name}_", "")
+                            is_sold_out = is_category_sold_out(CATALOG[category])
+                            keyboard.append([InlineKeyboardButton(
+                                f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                                callback_data=f"select_category_{category}"
+                            )])
+                            break
+                    # 2. Montrer aussi les catégories publiques
+                    if not any(category.startswith(f"{g}_") for g in admin_features._access_codes.get("groups", {}).keys()):
+                        is_sold_out = is_category_sold_out(CATALOG[category])
+                        keyboard.append([InlineKeyboardButton(
+                            f"{category} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                            callback_data=f"select_category_{category}"
+                        )])
+                else:
+                    # Pour les utilisateurs sans groupe, montrer uniquement les catégories publiques
+                    show_category = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if category.startswith(f"{group_name}_"):
+                            show_category = False
+                            break
+                    if show_category:
+                        is_sold_out = is_category_sold_out(CATALOG[category])
+                        keyboard.append([InlineKeyboardButton(
+                            category, 
+                            callback_data=f"select_category_{category}"
+                        )])
+
         keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_add_product")])
-        
+
         await query.message.edit_text(
             "📝 Sélectionnez la catégorie pour le nouveau produit:",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -1934,14 +2053,323 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return WAITING_PRODUCT_NAME
 
+    elif query.data.startswith("delete_product_category_"):
+        category = query.data.replace("delete_product_category_", "")
+        products = CATALOG.get(category, [])
+        user_id = query.from_user.id
+        keyboard = []
+
+        # Récupérer les groupes de l'utilisateur
+        user_groups = []
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Filtrer les produits selon les droits de l'utilisateur
+        for product in products:
+            if isinstance(product, dict):
+                show_product = False
+                product_name = product['name']
+
+                # Vérifier si c'est un produit de groupe
+                is_group_product = any(product_name.startswith(f"{group}_") 
+                                     for group in admin_features._access_codes.get("groups", {}).keys())
+
+                if is_group_product:
+                    # Pour les produits de groupe, vérifier si l'utilisateur est dans le bon groupe
+                    for group_name in user_groups:
+                        if product_name.startswith(f"{group_name}_"):
+                            show_product = True
+                            display_name = product_name.replace(f"{group_name}_", "")
+                            keyboard.append([InlineKeyboardButton(
+                                display_name,
+                                callback_data=f"confirm_delete_product_{category[:10]}_{product_name[:20]}"
+                            )])
+                            break
+                elif not user_groups:
+                    # Si l'utilisateur n'est dans aucun groupe, montrer uniquement les produits publics
+                    keyboard.append([InlineKeyboardButton(
+                        product_name,
+                        callback_data=f"confirm_delete_product_{category[:10]}_{product_name[:20]}"
+                    )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_delete_product")])
+
+        await query.message.edit_text(
+            f"⚠️ Sélectionnez le produit à supprimer de *{category}* :",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return SELECTING_PRODUCT_TO_DELETE
+
+    elif query.data == "delete_category":
+        keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Filtrer les catégories selon les groupes de l'utilisateur
+        for category in CATALOG.keys():
+            if category != 'stats':
+                if user_groups:
+                    # Pour les utilisateurs dans des groupes, montrer UNIQUEMENT leurs catégories de groupe
+                    for group_name in user_groups:
+                        if category.startswith(f"{group_name}_"):
+                            display_name = category.replace(f"{group_name}_", "")
+                            keyboard.append([InlineKeyboardButton(
+                                display_name,
+                                callback_data=f"confirm_delete_category_{category}"
+                            )])
+                            break
+                else:
+                    # Pour les utilisateurs sans groupe, montrer UNIQUEMENT les catégories publiques
+                    show_category = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if category.startswith(f"{group_name}_"):
+                            show_category = False
+                            break
+                    if show_category:
+                        keyboard.append([InlineKeyboardButton(
+                            category,
+                            callback_data=f"confirm_delete_category_{category}"
+                        )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="admin")])
+
+        await query.edit_message_text(
+            "⚠️ Sélectionnez la catégorie à supprimer:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_CATEGORY_TO_DELETE
+
+    elif query.data.startswith("confirm_delete_category_"):
+        category = query.data.replace("confirm_delete_category_", "")
+    
+        if category in CATALOG:
+            # Vérifier que l'utilisateur a le droit de supprimer cette catégorie
+            user_id = query.from_user.id
+            can_delete = True
+        
+            # Si la catégorie appartient à un groupe
+            for group_name in admin_features._access_codes.get("groups", {}).keys():
+                if category.startswith(f"{group_name}_"):
+                    # Vérifier si l'utilisateur est dans ce groupe
+                    if user_id not in admin_features._access_codes["groups"][group_name]:
+                        can_delete = False
+                    break
+
+            if can_delete:
+                del CATALOG[category]
+                save_catalog(CATALOG)
+            
+                # Afficher le nom de la catégorie sans le préfixe du groupe
+                display_name = category.split("_")[-1] if "_" in category else category
+            
+                keyboard = [
+                    [InlineKeyboardButton("🗑️ Supprimer une autre catégorie", callback_data="delete_category")],
+                    [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+                ]
+            
+                await query.edit_message_text(
+                    f"✅ Catégorie *{display_name}* supprimée avec succès!",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+            else:
+                await query.edit_message_text(
+                    "❌ Vous n'avez pas les droits pour supprimer cette catégorie.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 Retour", callback_data="admin")
+                    ]])
+                )
+        else:
+            await query.edit_message_text(
+                "❌ Cette catégorie n'existe plus.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 Retour", callback_data="admin")
+                ]])
+            )
+        return CHOOSING
+
+    elif query.data == "delete_product":
+        keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Filtrer les catégories selon les groupes de l'utilisateur
+        for category in CATALOG.keys():
+            if category != 'stats':
+                show_category = False
+                if user_groups:
+                    # Pour les utilisateurs dans des groupes
+                    # 1. Afficher leurs catégories de groupe
+                    for group_name in user_groups:
+                        if category.startswith(f"{group_name}_"):
+                            display_name = category.replace(f"{group_name}_", "")
+                            show_category = True
+                            keyboard.append([InlineKeyboardButton(
+                                display_name, 
+                                callback_data=f"delete_product_category_{category}"
+                            )])
+                            break
+
+                    # 2. Vérifier si la catégorie contient des produits du groupe
+                    if not show_category:  # Si ce n'est pas une catégorie de groupe
+                        has_group_products = False
+                        if category in CATALOG:
+                            for product in CATALOG[category]:
+                                if isinstance(product, dict) and 'name' in product:
+                                    for group_name in user_groups:
+                                        if product['name'].startswith(f"{group_name}_"):
+                                            has_group_products = True
+                                            break
+                                if has_group_products:
+                                    break
+                        
+                        if has_group_products:
+                            keyboard.append([InlineKeyboardButton(
+                                category, 
+                                callback_data=f"delete_product_category_{category}"
+                            )])
+                else:
+                    # Pour les utilisateurs sans groupe, montrer uniquement les catégories publiques
+                    show_category = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if category.startswith(f"{group_name}_"):
+                            show_category = False
+                            break
+                    if show_category:
+                        keyboard.append([InlineKeyboardButton(
+                            category, 
+                            callback_data=f"delete_product_category_{category}"
+                        )])
+
+        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_delete_product")])
+
+        await query.message.edit_text(
+            "⚠️ Sélectionnez la catégorie du produit à supprimer:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return SELECTING_CATEGORY_TO_DELETE
+
+    elif query.data.startswith("confirm_delete_product_"):
+            try:
+                # Extraire la catégorie et le nom du produit
+                parts = query.data.replace("confirm_delete_product_", "").split("_")
+                short_category = parts[0]
+                short_product = "_".join(parts[1:])  # Pour gérer les noms avec des underscores
+                
+                # Trouver la vraie catégorie et le vrai produit
+                category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
+                if category:
+                    product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
+                    if product_name:
+                        # Créer le clavier de confirmation avec les noms courts
+                        keyboard = [
+                            [
+                                InlineKeyboardButton("✅ Oui, supprimer", 
+                                    callback_data=f"really_delete_product_{category[:10]}_{product_name[:20]}"),
+                                InlineKeyboardButton("❌ Non, annuler", 
+                                    callback_data="cancel_delete_product")
+                            ]
+                        ]
+                    
+                        await query.message.edit_text(
+                            f"⚠️ *Êtes-vous sûr de vouloir supprimer le produit* `{product_name}` *?*\n\n"
+                            f"Cette action est irréversible !",
+                            reply_markup=InlineKeyboardMarkup(keyboard),
+                            parse_mode='Markdown'
+                        )
+                        return SELECTING_PRODUCT_TO_DELETE
+
+            except Exception as e:
+                print(f"Erreur lors de la confirmation de suppression: {e}")
+                return await show_admin_menu(update, context)
+
+    elif query.data.startswith("really_delete_product_"):
+        try:
+            parts = query.data.replace("really_delete_product_", "").split("_")
+            short_category = parts[0]
+            short_product = "_".join(parts[1:])
+
+            # Trouver la vraie catégorie et le vrai produit
+            category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
+            if category:
+                product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
+                if product_name:
+                    CATALOG[category] = [p for p in CATALOG[category] if p['name'] != product_name]
+                    save_catalog(CATALOG)
+                    await query.message.edit_text(
+                        f"✅ Le produit *{product_name}* a été supprimé avec succès !",
+                        parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Retour au menu", callback_data="admin")
+                        ]])
+                    )
+            return CHOOSING
+
+        except Exception as e:
+            print(f"Erreur lors de la suppression du produit: {e}")
+            return await show_admin_menu(update, context)
+
     elif query.data == "edit_category":
         if str(query.from_user.id) in ADMIN_IDS:
             keyboard = []
+            user_id = query.from_user.id
+            user_groups = []
+    
+            # Fonction helper pour vérifier le SOLD OUT
+            def is_category_sold_out(cat_products):
+                return (len(cat_products) == 1 and 
+                        isinstance(cat_products[0], dict) and 
+                        cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+            # Récupérer les groupes de l'utilisateur
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members:
+                        user_groups.append(group_name)
+
+            # Filtrer les catégories selon les groupes de l'utilisateur
             for category in CATALOG.keys():
-                keyboard.append([InlineKeyboardButton(
-                    f"{category} {'(SOLD OUT ❌)' if not CATALOG[category] else ''}",
-                    callback_data=f"edit_cat_{category}"
-                )])
+                if category != 'stats':
+                    if user_groups:
+                        # Pour les utilisateurs dans des groupes, montrer uniquement leurs catégories
+                        for group_name in user_groups:
+                            if category.startswith(f"{group_name}_"):
+                                display_name = category.replace(f"{group_name}_", "")
+                                is_sold_out = is_category_sold_out(CATALOG[category])
+                                keyboard.append([InlineKeyboardButton(
+                                    f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}",
+                                    callback_data=f"edit_cat_{category}"
+                                )])
+                                break
+                    else:
+                        # Pour les utilisateurs sans groupe, montrer uniquement les catégories publiques
+                        show_category = True
+                        for group_name in admin_features._access_codes.get("groups", {}).keys():
+                            if category.startswith(f"{group_name}_"):
+                                show_category = False
+                                break
+                        if show_category:
+                            is_sold_out = is_category_sold_out(CATALOG[category])
+                            keyboard.append([InlineKeyboardButton(
+                                f"{category} {'(SOLD OUT ❌)' if is_sold_out else ''}",
+                                callback_data=f"edit_cat_{category}"
+                            )])
+
             keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="admin")])
             await query.message.edit_text(
                 "Choisissez une catégorie à modifier:",
@@ -1954,10 +2382,17 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             if query.data.startswith("edit_cat_name_"):
                 # Gestion de la modification du nom
                 category = query.data.replace("edit_cat_name_", "")
+                # Obtenir le nom d'affichage (sans préfixe de groupe)
+                display_name = category
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if category.startswith(f"{group_name}_"):
+                        display_name = category.replace(f"{group_name}_", "")
+                        break
+
                 context.user_data['category_to_edit'] = category
                 await query.message.edit_text(
                     f"📝 *Modification du nom de catégorie*\n\n"
-                    f"Catégorie actuelle : *{category}*\n\n"
+                    f"Catégorie actuelle : *{display_name}*\n\n"
                     f"✍️ Envoyez le nouveau nom pour cette catégorie :",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("🔙 Retour", callback_data=f"edit_cat_{category}")
@@ -1968,13 +2403,20 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             else:
                 # Menu d'édition de catégorie
                 category = query.data.replace("edit_cat_", "")
+                # Obtenir le nom d'affichage (sans préfixe de groupe)
+                display_name = category
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if category.startswith(f"{group_name}_"):
+                        display_name = category.replace(f"{group_name}_", "")
+                        break
+
                 keyboard = [
                     [InlineKeyboardButton("✏️ Modifier le nom", callback_data=f"edit_cat_name_{category}")],
                     [InlineKeyboardButton("➕ Ajouter SOLD OUT", callback_data=f"add_soldout_{category}")],
                     [InlineKeyboardButton("🔙 Retour", callback_data="edit_category")]
                 ]
                 await query.message.edit_text(
-                    f"Que voulez-vous modifier pour la catégorie *{category}* ?",
+                    f"Que voulez-vous modifier pour la catégorie *{display_name}* ?",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
@@ -1995,10 +2437,17 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return WAITING_NEW_CATEGORY_NAME
 
+
     elif query.data.startswith("add_soldout_"):
         if str(query.from_user.id) in ADMIN_IDS:
             category = query.data.replace("add_soldout_", "")
-            # Demander confirmation avant d'ajouter SOLD OUT
+            # Obtenir le nom d'affichage
+            display_name = category
+            for group_name in admin_features._access_codes.get("groups", {}).keys():
+                if category.startswith(f"{group_name}_"):
+                    display_name = category.replace(f"{group_name}_", "")
+                    break
+
             keyboard = [
                 [
                     InlineKeyboardButton("✅ Oui, mettre en SOLD OUT", callback_data=f"confirm_soldout_{category}"),
@@ -2007,7 +2456,7 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             ]
             await query.message.edit_text(
                 f"⚠️ *Attention!*\n\n"
-                f"Vous êtes sur le point de mettre la catégorie *{category}* en SOLD OUT.\n\n"
+                f"Vous êtes sur le point de mettre la catégorie *{display_name}* en SOLD OUT.\n\n"
                 f"❗ *Cela supprimera tous les produits existants* dans cette catégorie.\n\n"
                 f"Êtes-vous sûr de vouloir continuer?",
                 reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2027,14 +2476,40 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             }]
             save_catalog(CATALOG)
             await query.answer("✅ SOLD OUT ajouté avec succès!")
-                
+            
             # Retourner au menu d'édition des catégories
             keyboard = []
+            # Filtrer les catégories selon les groupes de l'utilisateur
+            user_id = query.from_user.id
+            user_groups = []
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members:
+                        user_groups.append(group_name)
+
             for cat in CATALOG.keys():
-                keyboard.append([InlineKeyboardButton(
-                    f"{cat} {'(SOLD OUT ❌)' if not CATALOG[cat] or (len(CATALOG[cat]) == 1 and CATALOG[cat][0].get('name') == 'SOLD OUT ! ❌') else ''}",
-                    callback_data=f"edit_cat_{cat}"
-                )])
+                if cat != 'stats':
+                    show_category = False
+                    display_name = cat
+                
+                    if user_groups:
+                        # Pour les utilisateurs dans des groupes
+                        for group_name in user_groups:
+                            if cat.startswith(f"{group_name}_"):
+                                display_name = cat.replace(f"{group_name}_", "")
+                                show_category = True
+                                break
+                    else:
+                        # Pour les utilisateurs sans groupe
+                        show_category = not any(cat.startswith(f"{g}_") 
+                                             for g in admin_features._access_codes.get("groups", {}).keys())
+
+                    if show_category:
+                        keyboard.append([InlineKeyboardButton(
+                            f"{display_name} {'(SOLD OUT ❌)' if not CATALOG[cat] or (len(CATALOG[cat]) == 1 and CATALOG[cat][0].get('name') == 'SOLD OUT ! ❌') else ''}",
+                            callback_data=f"edit_cat_{cat}"
+                        )])
+
             keyboard.append([InlineKeyboardButton("🔙 Retour", callback_data="admin")])
             await query.message.edit_text(
                 "Choisissez une catégorie à modifier:",
@@ -2443,9 +2918,47 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             CATALOG['stats']['last_updated'] = datetime.now(paris_tz).strftime("%H:%M:%S")
             save_catalog(CATALOG)
 
-            products = CATALOG[category]
+            products = []
+            user_id = query.from_user.id
+
+            # Vérifier si c'est une catégorie de groupe
+            is_group_category = False
+            for group_name in admin_features._access_codes.get("groups", {}).keys():
+                if category.startswith(f"{group_name}_"):
+                    is_group_category = True
+                    # Vérifier si l'utilisateur est membre du groupe
+                    if user_id not in admin_features._access_codes["groups"][group_name]:
+                        await query.answer("❌ Vous n'avez pas accès à cette catégorie", show_alert=True)
+                        return CHOOSING
+                    break
+
+            # Filtrer les produits
+            for product in CATALOG[category]:
+                if is_group_category:
+                    # Dans une catégorie de groupe, montrer tous les produits
+                    products.append(product)
+                else:
+                    # Dans une catégorie publique, filtrer selon le groupe
+                    product_name = product['name']
+                    show_product = True
+                    for group_name in admin_features._access_codes.get("groups", {}).keys():
+                        if product_name.startswith(f"{group_name}_"):
+                            if user_id not in admin_features._access_codes["groups"][group_name]:
+                                show_product = False
+                            break
+                    if show_product:
+                        products.append(product)
+
+            # Obtenir le nom d'affichage pour la catégorie (sans préfixe)
+            display_category_name = category
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members and category.startswith(f"{group_name}_"):
+                        display_category_name = category.replace(f"{group_name}_", "")
+                        break
+
             # Afficher la liste des produits
-            text = f"*{category}*\n\n"
+            text = f"*{display_category_name}*\n\n"
             keyboard = []
             for product in products:
                 # Créer un ID court unique pour ce produit
@@ -2455,12 +2968,19 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                     'category': category,
                     'name': product['name']
                 }
+                # Afficher le nom sans préfixe de groupe si nécessaire
+                display_name = product['name']
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if display_name.startswith(f"{group_name}_"):
+                        display_name = display_name.replace(f"{group_name}_", "")
+                        break
                 keyboard.append([InlineKeyboardButton(
-                    product['name'],
-                    callback_data=f"product_{nav_id}"  # Utiliser l'ID court
+                    display_name,
+                    callback_data=f"product_{nav_id}"
                 )])
 
             keyboard.append([InlineKeyboardButton("🔙 Retour au menu", callback_data="show_categories")])
+
 
             try:
                 # Suppression du dernier message de produit (photo ou vidéo) si existe
@@ -2483,7 +3003,7 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
-        
+    
                 context.user_data['category_message_id'] = query.message.message_id
                 context.user_data['category_message_text'] = text
                 context.user_data['category_message_reply_markup'] = keyboard
@@ -2626,54 +3146,95 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif query.data == "edit_product":
         keyboard = []
+        user_id = query.from_user.id
+        user_groups = []
+
+        # Récupérer les groupes de l'utilisateur
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Fonction helper pour vérifier si une catégorie est en SOLD OUT
+        def is_category_sold_out(cat_products):
+            return (len(cat_products) == 1 and 
+                    isinstance(cat_products[0], dict) and 
+                    cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+        # Filtrer les catégories
         for category in CATALOG.keys():
             if category != 'stats':
-                keyboard.append([
-                    InlineKeyboardButton(
-                        category, 
-                        callback_data=f"editcat_{category}"  # Raccourci ici
-                    )
-                ])
+                is_group_category = any(category.startswith(f"{group}_") 
+                                      for group in admin_features._access_codes.get("groups", {}).keys())
+                
+                if is_group_category:
+                    # Montrer les catégories du groupe de l'utilisateur
+                    if user_groups:
+                        for group_name in user_groups:
+                            if category.startswith(f"{group_name}_"):
+                                display_name = category.replace(f"{group_name}_", "")
+                                is_sold_out = is_category_sold_out(CATALOG[category])
+                                keyboard.append([InlineKeyboardButton(
+                                    f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                                    callback_data=f"editcat_{category}"
+                                )])
+                else:
+                    # Montrer les catégories publiques à tout le monde
+                    is_sold_out = is_category_sold_out(CATALOG[category])
+                    keyboard.append([InlineKeyboardButton(
+                        f"{category} {'(SOLD OUT ❌)' if is_sold_out else ''}", 
+                        callback_data=f"editcat_{category}"
+                    )])
+
         keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")])
-        
+
         await query.message.edit_text(
             "✏️ Sélectionnez la catégorie du produit à modifier:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return SELECTING_CATEGORY
 
-    elif query.data.startswith("editcat_"):  # Nouveau gestionnaire avec nom plus court
-        category = query.data.replace("editcat_", "")
-        products = CATALOG.get(category, [])
-        
-        keyboard = []
-        for product in products:
-            if isinstance(product, dict):
-                # Créer un callback_data plus court
-                callback_data = f"editp_{category[:10]}_{product['name'][:20]}"
-                keyboard.append([
-                    InlineKeyboardButton(product['name'], callback_data=callback_data)
-                ])
-        keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")])
-        
-        await query.message.edit_text(
-            f"✏️ Sélectionnez le produit à modifier dans {category}:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return SELECTING_PRODUCT_TO_EDIT
-
     elif query.data.startswith("editp_"):
         try:
-            _, short_category, short_product = query.data.split("_", 2)
+            product_id = query.data.replace("editp_", "")
+            stored_data = context.user_data.get(f'callback_{product_id}')
             
-            # Trouver la vraie catégorie et le vrai produit
-            category = next((cat for cat in CATALOG.keys() if cat.startswith(short_category) or short_category.startswith(cat)), None)
-            if category:
-                product_name = next((p['name'] for p in CATALOG[category] if p['name'].startswith(short_product) or short_product.startswith(p['name'])), None)
-                if product_name:
+            if not stored_data:
+                print(f"Données non trouvées pour l'ID {product_id}")
+                return await show_admin_menu(update, context)
+            
+            category = stored_data['category']
+            product_name = stored_data['product_name']
+            
+            # Vérifier que la catégorie existe et que l'utilisateur y a accès
+            user_id = query.from_user.id
+            has_access = False
+            display_name = product_name
+            group_prefix = ""
+            
+            # Vérifier les permissions
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if category.startswith(f"{group_name}_"):
+                        if user_id in members:
+                            has_access = True
+                            group_prefix = f"{group_name}_"
+                            display_name = product_name.replace(group_prefix, "", 1)
+                        break
+                if not has_access:
+                    # Si c'est une catégorie publique
+                    has_access = not any(category.startswith(f"{g}_") 
+                                       for g in admin_features._access_codes.get("groups", {}).keys())
+            else:
+                has_access = True  # Si pas de groupes configurés
+
+            if has_access and category in CATALOG:
+                product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
+                if product:
                     context.user_data['editing_category'] = category
                     context.user_data['editing_product'] = product_name
 
+                    # Construire le clavier pour l'édition
                     keyboard = [
                         [InlineKeyboardButton("📝 Nom", callback_data="edit_name")],
                         [InlineKeyboardButton("💰 Prix", callback_data="edit_price")],
@@ -2683,17 +3244,98 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                     ]
 
                     await query.message.edit_text(
-                        f"✏️ Que souhaitez-vous modifier pour *{product_name}* ?\n"
+                        f"✏️ Que souhaitez-vous modifier pour *{display_name}* ?\n"
                         "Sélectionnez un champ à modifier:",
                         reply_markup=InlineKeyboardMarkup(keyboard),
                         parse_mode='Markdown'
                     )
                     return EDITING_PRODUCT_FIELD
-            
+                else:
+                    print(f"Produit non trouvé: {product_name}")
+            else:
+                print(f"Pas d'accès à la catégorie: {category}")
+                await query.answer("❌ Vous n'avez pas accès à ce produit", show_alert=True)
+
             return await show_admin_menu(update, context)
+            
         except Exception as e:
             print(f"Erreur dans editp_: {e}")
+            traceback.print_exc()
             return await show_admin_menu(update, context)
+
+    elif query.data.startswith("editcat_"):
+        category = query.data.replace("editcat_", "")
+        if category in CATALOG:
+            user_id = query.from_user.id
+            user_groups = []
+            user_group_prefix = ""
+            
+            # Récupérer les groupes de l'utilisateur et son préfixe
+            if "groups" in admin_features._access_codes:
+                for group_name, members in admin_features._access_codes["groups"].items():
+                    if user_id in members:
+                        user_groups.append(group_name)
+                        user_group_prefix = f"{group_name}_"
+                        break
+
+            products = CATALOG[category]
+            keyboard = []
+            display_name = category
+
+            # Détermine si c'est une catégorie publique
+            is_public_category = not any(category.startswith(f"{group}_") 
+                                       for group in admin_features._access_codes.get("groups", {}).keys())
+
+            for product in products:
+                if isinstance(product, dict):
+                    product_name = product['name']
+                    show_product = False
+
+                    if is_public_category:
+                        if user_groups:
+                            # Dans une catégorie publique avec un utilisateur de groupe
+                            # Montrer uniquement les produits de son groupe
+                            show_product = any(product_name.startswith(f"{group}_") for group in user_groups)
+                        else:
+                            # Utilisateur sans groupe : montrer uniquement les produits publics
+                            show_product = not any(product_name.startswith(f"{group}_") 
+                                                 for group in admin_features._access_codes.get("groups", {}).keys())
+                    else:
+                        # Dans une catégorie de groupe, montrer les produits si l'utilisateur est dans le bon groupe
+                        show_product = any(category.startswith(f"{group}_") and user_id in admin_features._access_codes["groups"][group]
+                                         for group in admin_features._access_codes.get("groups", {}).keys())
+
+                    if show_product:
+                        product_id = encode_for_callback(f"{category}_{product_name}")
+                        context.user_data[f'callback_{product_id}'] = {
+                            'category': category,
+                            'product_name': product_name,
+                            'group_prefix': user_group_prefix
+                        }
+
+                        # Afficher le nom sans le préfixe
+                        display_product_name = product_name
+                        for group in admin_features._access_codes.get("groups", {}).keys():
+                            prefix = f"{group}_"
+                            if display_product_name.startswith(prefix):
+                                display_product_name = display_product_name[len(prefix):]
+                                break
+
+                        keyboard.append([InlineKeyboardButton(
+                            display_product_name,
+                            callback_data=f"editp_{product_id}"
+                        )])
+
+            if not keyboard:
+                keyboard.append([InlineKeyboardButton("Aucun produit disponible", callback_data="noop")])
+
+            keyboard.append([InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")])
+
+            await query.message.edit_text(
+                f"✏️ Sélectionnez le produit à modifier dans {display_name}:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return SELECTING_PRODUCT_TO_EDIT
 
     elif query.data in ["edit_name", "edit_price", "edit_desc", "edit_media"]:
         field_mapping = {
@@ -2707,6 +3349,18 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     
         category = context.user_data.get('editing_category')
         product_name = context.user_data.get('editing_product')
+    
+        # Récupérer le préfixe du groupe de l'utilisateur
+        user_id = query.from_user.id
+        user_group_prefix = ""
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_group_prefix = f"{group_name}_"
+                    break
+        
+        # Sauvegarder le préfixe dans le context pour l'utiliser lors de l'édition
+        context.user_data['group_prefix'] = user_group_prefix
     
         product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
     
@@ -2733,21 +3387,45 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                 context.user_data['media_invitation_message_id'] = message.message_id
                 return WAITING_PRODUCT_MEDIA
             else:
-                # Votre code existant pour les autres champs
+                # Pour l'édition du nom, afficher la valeur sans le préfixe
                 current_value = product.get(field, "Non défini")
+                if field == 'name':
+                    # Enlever le préfixe pour l'affichage si présent
+                    for group in admin_features._access_codes.get("groups", {}).keys():
+                        prefix = f"{group}_"
+                        if current_value.startswith(prefix):
+                            current_value = current_value[len(prefix):]
+                            break
+
                 field_names = {
                     'name': 'nom',
                     'price': 'prix',
                     'description': 'description'
                 }
-                await query.message.edit_text(
-                    f"✏️ Modification du {field_names.get(field, field)}\n"
-                    f"Valeur actuelle : {current_value}\n\n"
-                    "Envoyez la nouvelle valeur :",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")
-                    ]])
-                )
+
+                # Message spécial pour l'édition du nom avec préfixe de groupe
+                if field == 'name' and user_group_prefix:
+                    bot_message = await query.message.edit_text(
+                        f"✏️ Modification du {field_names.get(field, field)}\n"
+                        f"Valeur actuelle : {current_value}\n\n"
+                        "Envoyez la nouvelle valeur :",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")
+                        ]])
+                    )
+                else:
+                    bot_message = await query.message.edit_text(
+                        f"✏️ Modification du {field_names.get(field, field)}\n"
+                        f"Valeur actuelle : {current_value}\n\n"
+                        "Envoyez la nouvelle valeur :",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit")
+                        ]])
+                    )
+            
+                # Sauvegarder l'ID du message pour pouvoir le supprimer plus tard
+                context.user_data['last_bot_message'] = bot_message.message_id
+            
                 return WAITING_NEW_VALUE
 
     elif query.data == "cancel_edit":
@@ -2777,13 +3455,52 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                
     elif query.data == "show_categories":
         keyboard = []
-        # Créer uniquement les boutons de catégories
+        user_id = update.effective_user.id
+
+        # Vérifier les groupes de l'utilisateur
+        user_groups = []
+        if "groups" in admin_features._access_codes:
+            for group_name, members in admin_features._access_codes["groups"].items():
+                if user_id in members:
+                    user_groups.append(group_name)
+
+        # Fonction helper pour vérifier le SOLD OUT
+        def is_category_sold_out(cat_products):
+            return (len(cat_products) == 1 and 
+                    isinstance(cat_products[0], dict) and 
+                    cat_products[0].get('name') == 'SOLD OUT ! ❌')
+
+        # Créer les boutons de catégories
         for category in CATALOG.keys():
             if category != 'stats':
-                keyboard.append([InlineKeyboardButton(category, callback_data=f"view_{category}")])
+                # Vérifier si c'est une catégorie de groupe
+                is_group_category = False
+                category_group = None
+                for group_name in admin_features._access_codes.get("groups", {}).keys():
+                    if category.startswith(f"{group_name}_"):
+                        is_group_category = True
+                        category_group = group_name
+                        break
 
-        # Ajouter uniquement le bouton retour à l'accueil
+                # Décider si l'utilisateur peut voir cette catégorie
+                show_category = False
+                if is_group_category:
+                    # Pour les catégories de groupe, l'utilisateur doit être membre du groupe
+                    if user_groups and category_group in user_groups:
+                        show_category = True
+                        display_name = category.replace(f"{category_group}_", "")
+                else:
+                    # Les catégories sans préfixe de groupe sont publiques
+                    show_category = True
+                    display_name = category
+
+                if show_category:
+                    is_sold_out = is_category_sold_out(CATALOG[category])
+                    display_text = f"{display_name} {'(SOLD OUT ❌)' if is_sold_out else ''}"
+                    keyboard.append([InlineKeyboardButton(display_text, callback_data=f"view_{category}")])
+
         keyboard.append([InlineKeyboardButton("🔙 Retour à l'accueil", callback_data="back_to_home")])
+
 
         try:
             message = await query.edit_message_text(
@@ -2795,7 +3512,6 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             context.user_data['menu_message_id'] = message.message_id
         except Exception as e:
             print(f"Erreur lors de la mise à jour du message des catégories: {e}")
-            # Si la mise à jour échoue, recréez le message
             message = await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text="📋 *Menu*\n\n"
@@ -2831,7 +3547,7 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                     keyboard.append([InlineKeyboardButton(button['name'], callback_data=f"custom_text_{button['id']}")])
 
             # Ajouter le bouton Réseaux avant le bouton Admin
-            keyboard.append([InlineKeyboardButton("📱 Réseaux", callback_data="show_networks")])
+            #keyboard.append([InlineKeyboardButton("📱 Réseaux", callback_data="show_networks")])
 
             # Ajouter le bouton admin en dernier si l'utilisateur est administrateur
             if str(update.effective_user.id) in ADMIN_IDS:
@@ -2843,6 +3559,130 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                 parse_mode='HTML'  
             )
             return CHOOSING
+
+async def edit_product_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Gère l'édition du nom d'un produit"""
+        user_id = update.message.from_user.id
+        new_name = update.message.text.strip()
+        
+        if 'editing_category' not in context.user_data or 'editing_product' not in context.user_data:
+            await update.message.reply_text("❌ Erreur: Aucun produit en cours d'édition.")
+            return await self.show_admin_menu(update, context)
+
+        category = context.user_data['editing_category']
+        old_name = context.user_data['editing_product']
+        
+        try:
+            # Vérifier si le produit actuel a un préfixe de groupe
+            current_prefix = ""
+            for group in self._access_codes.get("groups", {}).keys():
+                if old_name.startswith(f"{group}_"):
+                    current_prefix = f"{group}_"
+                    break
+
+            # Récupérer le préfixe du groupe de l'utilisateur si nécessaire
+            user_group_prefix = ""
+            if "groups" in self._access_codes:
+                for group_name, members in self._access_codes["groups"].items():
+                    if user_id in members:
+                        user_group_prefix = f"{group_name}_"
+                        break
+
+            # Déterminer le préfixe à utiliser
+            prefix_to_use = current_prefix or user_group_prefix
+
+            # Si le produit avait un préfixe ou si l'utilisateur est dans un groupe,
+            # ajouter le préfixe approprié au nouveau nom
+            if prefix_to_use:
+                # Si le nouveau nom contient déjà le préfixe, ne pas le rajouter
+                if not new_name.startswith(prefix_to_use):
+                    new_name = f"{prefix_to_use}{new_name}"
+            
+            # Mettre à jour le nom du produit
+            product_found = False
+            for product in self.CATALOG[category]:
+                if isinstance(product, dict) and product['name'] == old_name:
+                    product['name'] = new_name
+                    product_found = True
+                    break
+
+            if not product_found:
+                raise Exception("Produit non trouvé")
+
+            # Sauvegarder les modifications
+            self.save_catalog(self.CATALOG)
+            
+            # Message de confirmation avec le nom sans préfixe
+            display_name = new_name
+            if prefix_to_use and new_name.startswith(prefix_to_use):
+                display_name = new_name[len(prefix_to_use):]
+                
+            await update.message.reply_text(f"✅ Nom du produit modifié avec succès en : {display_name}")
+            return await self.show_admin_menu(update, context)
+
+        except Exception as e:
+            print(f"Erreur lors de la modification du nom: {e}")
+            await update.message.reply_text("❌ Une erreur est survenue lors de la modification du nom.")
+            return await self.show_admin_menu(update, context)
+
+async def handle_new_category_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    old_category = context.user_data.get('category_to_edit')
+    user_id = update.effective_user.id
+    
+    # Obtenir le groupe de l'utilisateur
+    user_group = None
+    if "groups" in admin_features._access_codes:
+        for group_name, members in admin_features._access_codes["groups"].items():
+            if user_id in members and old_category.startswith(f"{group_name}_"):
+                user_group = group_name
+                break
+
+    # Si c'est une catégorie de groupe, conserver le préfixe du groupe
+    if user_group:
+        new_category = f"{user_group}_{new_name}"
+    else:
+        new_category = new_name
+
+    # Vérifier si le nouveau nom existe déjà
+    if new_category in CATALOG:
+        await update.message.reply_text(
+            "❌ Une catégorie avec ce nom existe déjà.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Retour", callback_data="edit_category")
+            ]])
+        )
+        return WAITING_NEW_CATEGORY_NAME
+
+    # Mettre à jour le catalogue
+    CATALOG[new_category] = CATALOG.pop(old_category)
+    save_catalog(CATALOG)
+
+    # Nettoyer les messages
+    try:
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=update.message.message_id - 1
+        )
+        await update.message.delete()
+    except Exception as e:
+        print(f"Erreur lors de la suppression des messages: {e}")
+
+    # Message de confirmation avec le nom affiché sans le préfixe du groupe
+    display_name = new_name  # On affiche le nom sans le préfixe
+    keyboard = [
+        [InlineKeyboardButton("✏️ Modifier une autre catégorie", callback_data="edit_category")],
+        [InlineKeyboardButton("🔙 Retour", callback_data="admin")]
+    ]
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"✅ Catégorie renommée en *{display_name}* avec succès!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    
+    return CHOOSING
 
 async def get_file_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler temporaire pour obtenir le file_id de l'image banner"""
@@ -2996,6 +3836,14 @@ def main():
             ],
             states={
                 CHOOSING: [
+                    CallbackQueryHandler(admin_features.remove_group_user, pattern="^remove_group_user$"),
+                    CallbackQueryHandler(admin_features.select_user_to_remove, pattern="^remove_from_group_"),
+                    CallbackQueryHandler(admin_features.remove_user, pattern="^remove_user_"),
+                    CallbackQueryHandler(admin_features.delete_group, pattern="^delete_group$"),
+                    CallbackQueryHandler(admin_features.confirm_delete_group, pattern="^confirm_delete_group_"),
+                    CallbackQueryHandler(admin_features.manage_groups, pattern="^manage_groups$"),
+                    CallbackQueryHandler(admin_features.list_groups, pattern="^list_groups$"),
+                    CallbackQueryHandler(admin_features.start_create_group, pattern="^create_group$"),
                     CallbackQueryHandler(admin_features.handle_user_management, pattern="^user_page_[0-9]+$"),
                     CallbackQueryHandler(list_buttons_for_editing, pattern="^list_buttons_edit$"),
                     CallbackQueryHandler(handle_button_editing, pattern="^edit_button_[^_]+$"),
@@ -3010,6 +3858,9 @@ def main():
                     CallbackQueryHandler(admin_features.resend_broadcast, pattern="^resend_broadcast_"),
                     CallbackQueryHandler(admin_features.delete_broadcast, pattern="^delete_broadcast_"),
                     CallbackQueryHandler(admin_features.handle_user_management, pattern="^manage_users$"),
+                    CallbackQueryHandler(admin_features.select_group_for_user, pattern="^select_group_"),
+                    CallbackQueryHandler(admin_features.show_add_user_to_group, pattern="^add_group_user$"),
+                    CallbackQueryHandler(admin_features.select_group_for_category, pattern="^select_group_for_category_"),
                     CallbackQueryHandler(handle_normal_buttons),
                 ],
                 WAITING_CATEGORY_NAME: [
@@ -3060,8 +3911,8 @@ def main():
                     CallbackQueryHandler(handle_normal_buttons),
                 ],
                 WAITING_NEW_VALUE: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_value),
-                    CallbackQueryHandler(handle_normal_buttons),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_value),  # Sans le self
+                    CallbackQueryHandler(handle_normal_buttons)
                 ],
                 WAITING_BANNER_IMAGE: [
                     MessageHandler(filters.PHOTO, handle_banner_image),
@@ -3090,6 +3941,14 @@ def main():
                 WAITING_FOR_ACCESS_CODE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, handle_access_code),
                     CallbackQueryHandler(start, pattern="^cancel_access$"),
+                ],
+                WAITING_GROUP_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_features.handle_group_name),
+                    CallbackQueryHandler(admin_features.manage_groups, pattern="^manage_groups$")
+                ],
+                WAITING_GROUP_USER: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, admin_features.handle_group_user),
+                    CallbackQueryHandler(handle_normal_buttons),
                 ],
                 WAITING_BROADCAST_MESSAGE: [
                     MessageHandler(
@@ -3127,6 +3986,7 @@ def main():
         application.add_handler(CallbackQueryHandler(start, pattern="^start_cmd$"))
         application.add_handler(CommandHandler("gencode", admin_generate_code))
         application.add_handler(CommandHandler("listecodes", admin_list_codes))
+        application.add_handler(CommandHandler("group", admin_features.handle_group_command))
         application.add_handler(conv_handler)
 
         # Démarrer le bot avec les paramètres optimisés
