@@ -26,7 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+ 
 GAME_THREAD_ID = 6
+FORBIDDEN_THREADS = [1, 2]
 INITIAL_BALANCE = 1500
 MAX_PLAYERS = 20
 game_messages = {}  # Pour stocker l'ID du message de la partie en cours
@@ -582,6 +584,8 @@ def cleanup_player_games(player_id):
     if player_id in waiting_games:
         waiting_games.remove(player_id)
 
+
+
 def get_player_rank(balance: int) -> tuple[str, str]:
     """
     Retourne le rang du joueur basé sur son solde
@@ -640,10 +644,22 @@ def get_status_emoji(status: str) -> str:
     }
     return f"{emojis.get(status, '❓')} {status.upper()}"
 
+async def handle_forbidden_thread(message) -> bool:
+    """Supprime silencieusement le message si c'est dans un thread interdit"""
+    if message.message_thread_id in FORBIDDEN_THREADS:
+        try:
+            await message.delete()
+        except Exception:
+            pass  # Ignore silencieusement les erreurs de suppression
+        return True
+    return False
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Démarre le bot et inscrit le joueur s'il ne l'est pas déjà"""
     user = update.effective_user
     chat_id = update.effective_chat.id
+
+    if is_forbidden_thread(update.message): return
 
     # Vérifier si l'utilisateur existe déjà dans la base de données
     if not db.user_exists(user.id):
@@ -836,6 +852,8 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.cursor.execute('SELECT last_daily FROM users WHERE user_id = ?', (user.id,))
     result = db.cursor.fetchone()
     
+    if await handle_forbidden_thread(update.message): return
+
     if result and result[0]:
         last_daily = datetime.fromisoformat(result[0])
         if current_time - last_daily < timedelta(days=1):
@@ -875,7 +893,7 @@ async def create_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Utilisez le THREAD ID spécifique pour les messages de jeu
     message_thread_id = GAME_THREAD_ID
-    
+    if await handle_forbidden_thread(update.message): return
     # Vérifier s'il y a déjà une partie en cours dans ce chat
     for g in active_games.values():
         if hasattr(g, 'initial_chat_id') and g.initial_chat_id == chat_id and g.game_status == 'playing':
@@ -1721,6 +1739,8 @@ async def rangs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le solde et les informations bancaires du joueur"""
     user = update.effective_user
+
+    if await handle_forbidden_thread(update.message): return
     
     # Vérifier si l'utilisateur existe
     if not db.user_exists(user.id):
