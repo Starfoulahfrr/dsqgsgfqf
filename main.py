@@ -7,6 +7,7 @@ import asyncio
 import shutil
 import os
 import re
+import random 
 from datetime import datetime, time
 import pytz
 from telegram.error import NetworkError, TimedOut, RetryAfter
@@ -195,6 +196,15 @@ def print_catalog_debug():
                 print(f"  Produit: {product['name']}")
                 if 'media' in product:
                     print(f"    Médias ({len(product['media'])}): {product['media']}")
+
+def get_sibling_products(category, product_name):
+    products = CATALOG[category]
+    current_index = next((i for i, p in enumerate(products) if p['name'] == product_name), -1)
+    
+    prev_product = products[current_index - 1] if current_index > 0 else None
+    next_product = products[current_index + 1] if current_index < len(products) - 1 else None
+    
+    return prev_product, next_product
 
 # États de conversation
 WAITING_FOR_ACCESS_CODE = "WAITING_FOR_ACCESS_CODE"
@@ -1954,8 +1964,6 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return WAITING_BUTTON_VALUE
 
-
-
     elif query.data == "edit_banner_image":
             msg = await query.message.edit_text(
                 "📸 Veuillez envoyer la nouvelle image bannière :",
@@ -2440,7 +2448,6 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return WAITING_NEW_CATEGORY_NAME
 
-
     elif query.data.startswith("add_soldout_"):
         if str(query.from_user.id) in ADMIN_IDS:
             category = query.data.replace("add_soldout_", "")
@@ -2594,7 +2601,6 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             print(f"Erreur lors de l'affichage du message: {e}")
             await query.answer("Une erreur est survenue lors de l'affichage du message", show_alert=True)
             return CHOOSING
-
 
     elif query.data == "edit_welcome":
             current_message = CONFIG.get('welcome_message', "Message non configuré")
@@ -2780,17 +2786,15 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     elif query.data.startswith("product_"):
         try:
             _, nav_id = query.data.split("_", 1)
-            # Récupérer les informations du produit à partir de l'ID stocké
             product_info = context.user_data.get(f'nav_product_{nav_id}')
-        
+    
             if not product_info:
                 await query.answer("Produit non trouvé")
                 return
 
             category = product_info['category']
             product_name = product_info['name']
-        
-            # Récupérer le produit
+    
             product = next((p for p in CATALOG[category] if p['name'] == product_name), None)
 
             if product:
@@ -2798,28 +2802,57 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                 caption += f"💰 <b>Prix:</b>\n{product['price']}\n\n"
                 caption += f"📝 <b>Description:</b>\n{product['description']}"
 
-                keyboard = [[
-                    InlineKeyboardButton("🔙 Retour à la catégorie", callback_data=f"view_{category}"),
-                    InlineKeyboardButton(
-                        "🛒 Commander",
-                        **({'url': CONFIG['order_url']} if CONFIG.get('order_url') 
-                           else {'callback_data': "show_order_text"})
-                    )
-                ]]
-
+                keyboard = []
+            
+                # Navigation des médias (en premier)
                 if 'media' in product and product['media']:
                     media_list = product['media']
                     media_list = sorted(media_list, key=lambda x: x.get('order_index', 0))
                     total_media = len(media_list)
                     context.user_data['current_media_index'] = 0
-                    current_media = media_list[0]
-
+                    current_media = media_list[0]  # Initialisation de current_media ici
+                
                     if total_media > 1:
-                        keyboard.insert(0, [
-                            InlineKeyboardButton("⬅️ Précédent", callback_data=f"prev_{nav_id}"),
-                            InlineKeyboardButton("➡️ Suivant", callback_data=f"next_{nav_id}")
+                        keyboard.append([
+                            InlineKeyboardButton("⬅️ Média précédent", callback_data=f"prev_{nav_id}"),
+                            InlineKeyboardButton("Média suivant ➡️", callback_data=f"next_{nav_id}")
                         ])
+            
+                # Navigation entre produits (en deuxième)
+                prev_product, next_product = get_sibling_products(category, product['name'])
+                if prev_product or next_product:
+                    product_nav = []
+                    if prev_product:
+                        new_nav_id = f"product_{random.randint(1000, 9999)}"
+                        context.user_data[f'nav_product_{new_nav_id}'] = {
+                            'category': category,
+                            'name': prev_product['name']
+                        }
+                        product_nav.append(InlineKeyboardButton("◀️ Produit précédent", callback_data=new_nav_id))
+                    if next_product:
+                        new_nav_id = f"product_{random.randint(1000, 9999)}"
+                        context.user_data[f'nav_product_{new_nav_id}'] = {
+                            'category': category,
+                            'name': next_product['name']
+                        }
+                        product_nav.append(InlineKeyboardButton("Produit suivant ▶️", callback_data=new_nav_id))
+                    keyboard.append(product_nav)
 
+                # Bouton Commander (au centre)
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "🛒 Commander",
+                        **({'url': CONFIG['order_url']} if CONFIG.get('order_url') 
+                           else {'callback_data': "show_order_text"})
+                    )
+                ])
+
+                # Bouton Retour à la catégorie (en dernier)
+                keyboard.append([
+                    InlineKeyboardButton("🔙 Retour à la catégorie", callback_data=f"view_{category}")
+                ])
+
+                if 'media' in product and product['media']:
                     try:
                         await query.message.delete()
                     except Exception as e:
@@ -2871,7 +2904,6 @@ async def handle_normal_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                         reply_markup=InlineKeyboardMarkup(keyboard),
                         parse_mode='HTML'
                     )
-
                 # Incrémenter les stats du produit
                 if 'stats' not in CATALOG:
                     CATALOG['stats'] = {
